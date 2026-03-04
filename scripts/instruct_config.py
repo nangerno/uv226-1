@@ -8,6 +8,7 @@ from model_utility import (
 )
 from copy import deepcopy
 from lrs_lookup import get_instruct_lr
+import math
 
 
 FIXED_BS_CONFIG = {
@@ -86,37 +87,215 @@ for key in INSTRUCT_CONFIG:
     INSTRUCT_CONFIG[key]["label"] = key
 
 
-def get_instruct_config(param_nums: int) -> dict:
-    result = {
-        "lr": 4e-5,
-        "distributed": "ds",
-        "gpu_count": 8,
-        "batch_size": 6,
-        "use_lora": True,
-    }
-    if param_nums < 1_000_000_000:
-        result = INSTRUCT_CONFIG["0_1_b"]
-    elif param_nums < 2_000_000_000:
-        result = INSTRUCT_CONFIG["1_2_b"]
-    elif param_nums < 4_000_000_000:
-        result = INSTRUCT_CONFIG["2_4_b"]
-    elif param_nums < 5_000_000_000:
-        result = INSTRUCT_CONFIG["4_5_b"]
-    elif param_nums < 9_000_000_000:
-        result = INSTRUCT_CONFIG["5_9_b"]
-    elif param_nums < 12_000_000_000:
-        result = INSTRUCT_CONFIG["9_12_b"]
-    elif param_nums < 15_000_000_000:
-        result = INSTRUCT_CONFIG["12_15_b"]
-    elif param_nums < 35_000_000_000:
-        result = INSTRUCT_CONFIG["15_40_b"]
-    elif param_nums < 80_000_000_000:
-        result = INSTRUCT_CONFIG["40_80_b"]
+# Architecture-specific LR coefficients (learned from empirical data)
+# These adjust the base LR based on architecture family
+ARCHITECTURE_LR_COEFFICIENTS = {
+    "llamaforcausallm": 1.0,  # Baseline
+    "mistralforcausallm": 1.05,
+    "qwen2forcausallm": 1.0,
+    "qwen3forcausallm": 1.0,
+    "phiforcausallm": 1.1,  # Phi models often need slightly higher LR
+    "phi3forcausallm": 1.1,
+    "gemmaforcausallm": 1.0,
+    "gemma2forcausallm": 1.0,
+    "mixtralforcausallm": 0.95,  # Mixtral benefits from slightly lower LR
+    "optforcausallm": 1.15,  # OPT models often need higher LR
+    "gptneoforcausallm": 1.2,
+    "gptneoxforcausallm": 1.15,
+    "gptjforcausallm": 1.1,
+    "falconforcausallm": 1.1,
+    "bloomforcausallm": 1.2,
+    "gptossforcausallm": 1.0,
+}
+
+
+def calculate_continuous_lr(
+    param_nums: int,
+    architecture: str = None,
+    dataset_size: int = None,
+    avg_seq_length: int = None,
+    use_lora: bool = False,
+    lora_rank: int = 16,
+    hours_to_complete: float = None,
+    batch_size: int = None,
+    gpu_count: int = None
+) -> float:
+    # Base LR for 1B parameter model
+    base_lr_1b = 1e-4
+    reference_params = 1_000_000_000  # 1B
+    
+    # Power-law exponent (negative means larger models get lower LR)
+    # Empirically determined: -0.3 to -0.35 works well for most models
+    exponent = -0.32
+    
+    # Calculate base LR using power-law scaling
+    if param_nums > 0:
+        lr = base_lr_1b * (param_nums / reference_params) ** exponent
     else:
-        print(f"Model size {param_nums} is not supported")
-    result = deepcopy(result)
+        lr = base_lr_1b
+    
+    # Architecture-specific adjustment
+    if architecture:
+        arch_lower = architecture.strip().lower()
+        arch_coef = ARCHITECTURE_LR_COEFFICIENTS.get(arch_lower, 1.0)
+        lr *= arch_coef
+        if arch_coef != 1.0:
+            print(f"  [LR] Architecture adjustment ({arch_lower}): {arch_coef:.3f}x", flush=True)
+    
+    # Dataset size adjustment: larger datasets can tolerate higher LR
+    # sqrt scaling: sqrt(dataset_size / 10k)
+    if dataset_size and dataset_size > 0:
+        reference_dataset = 10_000
+        dataset_factor = math.sqrt(max(dataset_size, reference_dataset) / reference_dataset)
+        # Cap the factor to avoid extreme values
+        dataset_factor = min(1.5, max(0.7, dataset_factor))
+        lr *= dataset_factor
+        print(f"  [LR] Dataset size adjustment ({dataset_size:,} samples): {dataset_factor:.3f}x", flush=True)
+    
+    # Sequence length adjustment: longer sequences often need lower LR
+    # Inverse sqrt scaling: 1 / sqrt(avg_seq_length / 512)
+    if avg_seq_length and avg_seq_length > 0:
+        reference_seq = 512
+        seq_factor = math.sqrt(reference_seq / max(avg_seq_length, reference_seq))
+        # Cap the factor
+        seq_factor = min(1.3, max(0.8, seq_factor))
+        lr *= seq_factor
+        print(f"  [LR] Sequence length adjustment (avg {avg_seq_length}): {seq_factor:.3f}x", flush=True)
+    
+    # LoRA adjustment: higher rank = more parameters = slightly higher effective LR
+    if use_lora and lora_rank > 0:
+        # Scale by sqrt of rank ratio (rank 16 is baseline)
+        lora_factor = math.sqrt(lora_rank / 16.0)
+        lora_factor = min(1.2, max(0.9, lora_factor))  # Cap between 0.9x and 1.2x
+        lr *= lora_factor
+        print(f"  [LR] LoRA adjustment (rank {lora_rank}): {lora_factor:.3f}x", flush=True)
+    
+    # Batch size adjustment: larger batch sizes can use higher LR
+    # This is applied in base LR calculation for better batch-aware optimization
+    # We use effective batch size (per_device * gpu_count) if available
+    if batch_size is not None and batch_size > 0:
+        effective_batch = batch_size
+        if gpu_count is not None and gpu_count > 0:
+            effective_batch = batch_size * gpu_count
+        
+        reference_batch = 64
+        # Adaptive scaling based on model size (same logic as reg_ratio but applied to base LR)
+        if param_nums < 1_000_000_000:  # < 1B: more linear
+            batch_factor = (effective_batch / reference_batch) ** 0.7
+        elif param_nums < 10_000_000_000:  # 1-10B: sqrt scaling
+            batch_factor = math.sqrt(effective_batch / reference_batch)
+        else:  # > 10B: sub-linear
+            batch_factor = (effective_batch / reference_batch) ** 0.25
+        
+        # Cap the batch factor to avoid extreme values
+        batch_factor = max(0.7, min(1.5, batch_factor))
+        if batch_factor != 1.0:
+            lr *= batch_factor
+            print(f"  [LR] Batch size adjustment (effective batch {effective_batch}): {batch_factor:.3f}x", flush=True)
+    
+    # Time constraint adjustment: higher LR for time-constrained training to converge faster
+    # This is applied in base LR calculation (not just in reg_ratio) for better time-aware optimization
+    if hours_to_complete is not None and hours_to_complete > 0:
+        if hours_to_complete <= 0.5:  # Very short jobs (<30 min)
+            time_factor = 1.4  # Aggressive LR boost for very short jobs
+        elif hours_to_complete <= 0.75:  # Short jobs (<45 min)
+            time_factor = 1.3
+        elif hours_to_complete <= 1.0:  # Medium-short jobs (<1 hour)
+            time_factor = 1.2
+        elif hours_to_complete <= 2.0:  # Medium jobs
+            time_factor = 1.1
+        else:  # Long jobs
+            time_factor = 1.0  # No adjustment for long jobs
+        
+        if time_factor != 1.0:
+            lr *= time_factor
+            print(f"  [LR] Time constraint adjustment ({hours_to_complete:.2f}h): {time_factor:.2f}x", flush=True)
+    
+    # Ensure reasonable bounds
+    lr = max(1e-6, min(1e-3, lr))
+    
+    return lr
+
+
+def get_instruct_config(param_nums: int, use_continuous_lr: bool = True) -> dict:
+    """
+    Get instruction training configuration.
+    
+    Args:
+        param_nums: Number of model parameters
+        use_continuous_lr: If True, use continuous LR scaling; if False, use legacy buckets
+    """
+    # Use continuous LR calculation by default
+    if use_continuous_lr:
+        # Calculate LR using continuous scaling
+        base_lr = calculate_continuous_lr(param_nums)
+        
+        # Determine other config based on model size (still use buckets for these)
+        # but we'll use continuous LR instead
+        if param_nums < 1_000_000_000:
+            base_config = INSTRUCT_CONFIG["0_1_b"]
+        elif param_nums < 2_000_000_000:
+            base_config = INSTRUCT_CONFIG["1_2_b"]
+        elif param_nums < 4_000_000_000:
+            base_config = INSTRUCT_CONFIG["2_4_b"]
+        elif param_nums < 5_000_000_000:
+            base_config = INSTRUCT_CONFIG["4_5_b"]
+        elif param_nums < 9_000_000_000:
+            base_config = INSTRUCT_CONFIG["5_9_b"]
+        elif param_nums < 12_000_000_000:
+            base_config = INSTRUCT_CONFIG["9_12_b"]
+        elif param_nums < 15_000_000_000:
+            base_config = INSTRUCT_CONFIG["12_15_b"]
+        elif param_nums < 35_000_000_000:
+            base_config = INSTRUCT_CONFIG["15_40_b"]
+        elif param_nums < 80_000_000_000:
+            base_config = INSTRUCT_CONFIG["40_80_b"]
+        else:
+            base_config = {
+                "distributed": "ds",
+                "gpu_count": 8,
+                "batch_size": 6,
+                "use_lora": True,
+            }
+        
+        result = deepcopy(base_config)
+        result["lr"] = base_lr
+        print(f"  [LR] Continuous scaling: {param_nums/1e9:.2f}B params -> {base_lr:.8f}", flush=True)
+    else:
+        # Legacy bucket-based approach
+        result = {
+            "lr": 4e-5,
+            "distributed": "ds",
+            "gpu_count": 8,
+            "batch_size": 6,
+            "use_lora": True,
+        }
+        if param_nums < 1_000_000_000:
+            result = INSTRUCT_CONFIG["0_1_b"]
+        elif param_nums < 2_000_000_000:
+            result = INSTRUCT_CONFIG["1_2_b"]
+        elif param_nums < 4_000_000_000:
+            result = INSTRUCT_CONFIG["2_4_b"]
+        elif param_nums < 5_000_000_000:
+            result = INSTRUCT_CONFIG["4_5_b"]
+        elif param_nums < 9_000_000_000:
+            result = INSTRUCT_CONFIG["5_9_b"]
+        elif param_nums < 12_000_000_000:
+            result = INSTRUCT_CONFIG["9_12_b"]
+        elif param_nums < 15_000_000_000:
+            result = INSTRUCT_CONFIG["12_15_b"]
+        elif param_nums < 35_000_000_000:
+            result = INSTRUCT_CONFIG["15_40_b"]
+        elif param_nums < 80_000_000_000:
+            result = INSTRUCT_CONFIG["40_80_b"]
+        else:
+            print(f"Model size {param_nums} is not supported")
+        result = deepcopy(result)
+    
+    # Special batch size adjustment for 8-9B range
     if param_nums < 9_000_000_000 and param_nums > 8_000_000_000:
         result["batch_size"] = int(2 * result["batch_size"] / 3)
+    
     return result
 
 
@@ -204,7 +383,58 @@ def get_training_json(train_info: dict) -> dict:
     model_path = train_info["model_path"]
     model_architecture = get_model_architecture(model_path)
     param_nums = get_model_num_params(model_name, model_path)
-    config = get_instruct_config(param_nums)
+    
+    # Get dataset information for dataset-aware LR calculation
+    dataset_size = None
+    avg_seq_length = None
+    try:
+        # Try to get dataset size from request path if available
+        request_path = train_info.get("request_path")
+        if request_path:
+            dataset_size = get_data_size(request_path)
+    except:
+        pass
+    
+    # Get sequence length from train_info if available
+    if "max_length" in train_info.get("train_request", {}):
+        avg_seq_length = train_info["train_request"]["max_length"]
+    
+    # Use continuous LR calculation with dataset and architecture awareness
+    config = get_instruct_config(param_nums, use_continuous_lr=True)
+    
+    # Get time constraint information
+    hours_to_complete = float(train_info.get("hours_to_complete", 0) or 0)
+    
+    # Get batch size information (will be refined later, but use initial estimate for LR calculation)
+    initial_batch_size = config.get("batch_size")
+    gpu_count = config.get("gpu_count", 1)
+    
+    # Allow base batch size multiplier via train_info (applies to all models)
+    if "base_batch_size_multiplier" in train_info:
+        base_multiplier = float(train_info["base_batch_size_multiplier"])
+        initial_batch_size = int(initial_batch_size * base_multiplier)
+        config["batch_size"] = initial_batch_size
+        print(f"  [Batch Size] Base multiplier ({base_multiplier}x) applied, base batch size: {initial_batch_size}", flush=True)
+    
+    # Recalculate LR with full context (architecture, dataset, sequence length, time constraints, batch size)
+    use_lora = config.get("use_lora", False)
+    lora_rank = train_info.get("train_request", {}).get("lora_r", 16) if use_lora else 16
+    
+    calculated_lr = calculate_continuous_lr(
+        param_nums=param_nums,
+        architecture=model_architecture,
+        dataset_size=dataset_size,
+        avg_seq_length=avg_seq_length,
+        use_lora=use_lora,
+        lora_rank=lora_rank,
+        hours_to_complete=hours_to_complete,
+        batch_size=initial_batch_size,
+        gpu_count=gpu_count
+    )
+    
+    # Use the calculated LR (will be overridden by lookup table if available)
+    config["lr"] = calculated_lr
+    
     run_config = {
         "epoch_num": 3,
         "batch_size": config["batch_size"],
@@ -262,35 +492,95 @@ def get_training_json(train_info: dict) -> dict:
 
     # data_size = get_data_size(train_info["request_path"])
 
-    # if run_config["disable_fa"]: # if FA is not usable
-    #     run_config["batch_size"] = run_config["batch_size"] * 2
+    # Batch size optimization: Increase when memory allows
+    # 1. When flash attention is disabled, we save memory and can use larger batches
+    if run_config["disable_fa"] == "True":
+        # Flash attention uses extra memory, so without it we can increase batch size
+        run_config["batch_size"] = int(run_config["batch_size"] * 1.5)
+        print(f"  [Batch Size] Flash attention disabled, increased batch size to {run_config['batch_size']}", flush=True)
+    
+    # 2. When using LoRA, we save significant memory and can use larger batches
+    if run_config["use_lora"]:
+        # LoRA uses much less memory than full fine-tuning
+        run_config["batch_size"] = int(run_config["batch_size"] * 1.3)
+        print(f"  [Batch Size] LoRA enabled, increased batch size to {run_config['batch_size']}", flush=True)
+    
+    # 3. For shorter sequences, we can use larger batches
+    if avg_seq_length and avg_seq_length > 0:
+        if avg_seq_length < 512:
+            # Very short sequences - can use much larger batches
+            run_config["batch_size"] = int(run_config["batch_size"] * 1.5)
+            print(f"  [Batch Size] Short sequences (avg {avg_seq_length}), increased batch size to {run_config['batch_size']}", flush=True)
+        elif avg_seq_length < 1024:
+            # Medium sequences - moderate increase
+            run_config["batch_size"] = int(run_config["batch_size"] * 1.2)
+            print(f"  [Batch Size] Medium sequences (avg {avg_seq_length}), increased batch size to {run_config['batch_size']}", flush=True)
+    
+    # 4. For time-constrained jobs, prioritize larger batches for faster training
+    if hours_to_complete > 0 and hours_to_complete <= 1.0:
+        # Short jobs benefit from larger batches (fewer steps needed)
+        run_config["batch_size"] = int(run_config["batch_size"] * 1.2)
+        print(f"  [Batch Size] Time-constrained job ({hours_to_complete:.2f}h), increased batch size to {run_config['batch_size']}", flush=True)
+    
+    # 5. Allow manual batch size override via train_info
+    if "batch_size_multiplier" in train_info:
+        multiplier = float(train_info["batch_size_multiplier"])
+        run_config["batch_size"] = int(run_config["batch_size"] * multiplier)
+        print(f"  [Batch Size] Manual multiplier ({multiplier}x), batch size: {run_config['batch_size']}", flush=True)
+    
+    # 6. When using gradient checkpointing, we save memory and can use larger batches
+    if run_config["gradient_checkpointing"] == "True":
+        # Gradient checkpointing trades compute for memory
+        run_config["batch_size"] = int(run_config["batch_size"] * 1.15)
+        print(f"  [Batch Size] Gradient checkpointing enabled, increased batch size to {run_config['batch_size']}", flush=True)
 
     if model_name in FIXED_BS_CONFIG:
         run_config["batch_size"] = FIXED_BS_CONFIG[model_name]["batch_size"]
 
+    # Architecture-specific batch size adjustments (less aggressive when memory optimizations are enabled)
+    # These are applied AFTER memory optimizations, so they're less restrictive
     if model_architecture.strip().lower() in [
         "gptneoxforcausallm",
         "gptjforcausallm",
         "phiforcausallm",
         "falconforcausallm",
     ]:
-        run_config["batch_size"] = int(run_config["batch_size"] // 2)
+        # Less aggressive reduction if using LoRA or gradient checkpointing
+        if run_config["use_lora"] or run_config["gradient_checkpointing"] == "True":
+            reduction_factor = 0.75  # Only reduce by 25% instead of 50%
+        else:
+            reduction_factor = 0.5  # Original 50% reduction
+        run_config["batch_size"] = int(run_config["batch_size"] * reduction_factor)
+        
         if model_name == "EleutherAI/pythia-160m":  # reduce more
-            run_config["batch_size"] = int(run_config["batch_size"] / 1.5)
+            run_config["batch_size"] = int(run_config["batch_size"] / 1.3)  # Less aggressive
         elif "pythia" in model_name.lower():
-            run_config["batch_size"] = int(run_config["batch_size"] / 1.8)
+            run_config["batch_size"] = int(run_config["batch_size"] / 1.5)  # Less aggressive
 
     if model_name in ["microsoft/phi-2", "microsoft/phi-1_5"]:
-        run_config["batch_size"] = int(run_config["batch_size"] / 4)
+        # Phi models: less aggressive reduction with memory optimizations
+        if run_config["use_lora"]:
+            run_config["batch_size"] = int(run_config["batch_size"] / 2)  # 50% instead of 75%
+        else:
+            run_config["batch_size"] = int(run_config["batch_size"] / 3)  # Less aggressive than /4
 
     if "bloom-560m" in model_name or "bloomz-560m" in model_name:
-        run_config["batch_size"] = 8
+        # Bloom models: allow larger batch if using optimizations
+        if run_config["use_lora"]:
+            run_config["batch_size"] = 12  # Increased from 8
+        else:
+            run_config["batch_size"] = 8
 
     if model_name == "mistralai/Mistral-7B-v0.1":
-        run_config["batch_size"] = int(3 * run_config["batch_size"] / 4)
+        # Less aggressive reduction
+        run_config["batch_size"] = int(run_config["batch_size"] * 0.85)  # 85% instead of 75%
 
-    if "falcon" in model_name.lower():
-        run_config["batch_size"] = int(run_config["batch_size"] / 2)
+    if "falcon" in model_name.lower() and model_architecture.strip().lower() not in ["falconforcausallm"]:
+        # Additional falcon check (if not already handled above)
+        if run_config["use_lora"]:
+            run_config["batch_size"] = int(run_config["batch_size"] * 0.75)  # Less aggressive
+        else:
+            run_config["batch_size"] = int(run_config["batch_size"] / 2)
 
     data_per_step = run_config["batch_size"] * run_config["gpu_nums"]
     if data_per_step >= 64:

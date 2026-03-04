@@ -348,26 +348,47 @@ def _calculate_adaptive_reg_ratio(
     """Calculate reg_ratio using adaptive method (combination of factors)."""
     reg_ratio = 1.0
     
-    # Time-aware adjustment: Higher LR for short jobs to converge faster
+    # Time-aware adjustment: Additional fine-tuning for time constraints
+    # Note: Base LR already includes time constraints, so this is a smaller additional adjustment
+    # for reg_ratio to account for batch size interactions with time constraints
     if hours_to_complete is not None and hours_to_complete > 0:
+        # Smaller adjustment here since base LR already has time factor
+        # This accounts for how batch size scaling interacts with time constraints
         if hours_to_complete <= 0.5:  # Very short jobs (<30 min)
-            time_factor = 1.5  # Aggressive LR boost
+            time_factor = 1.1  # Small additional boost for very short jobs
         elif hours_to_complete <= 0.75:  # Short jobs (<45 min)
-            time_factor = 1.4
+            time_factor = 1.05
         elif hours_to_complete <= 1.0:  # Medium-short jobs (<1 hour)
-            time_factor = 1.3
+            time_factor = 1.03
         elif hours_to_complete <= 2.0:  # Medium jobs
-            time_factor = 1.1
+            time_factor = 1.01
         else:  # Long jobs
             time_factor = 1.0
-        reg_ratio *= time_factor
-        print(f"  [reg_ratio]   - time_aware adjustment: {hours_to_complete:.2f}h -> factor {time_factor:.2f}", flush=True)
+        if time_factor != 1.0:
+            reg_ratio *= time_factor
+            print(f"  [reg_ratio]   - time_aware fine-tuning: {hours_to_complete:.2f}h -> factor {time_factor:.2f} (base LR already has time adjustment)", flush=True)
     
-    # Batch size adjustment (sqrt scaling)
+    # Batch size fine-tuning adjustment
+    # Note: Base LR already includes batch_size, so this is a smaller additional adjustment
+    # for reg_ratio to account for gradient accumulation and other batch-related factors
     if batch_size is not None and batch_size > 0:
         reference_batch = 64
-        batch_factor = np.sqrt(batch_size / reference_batch)
-        reg_ratio *= batch_factor
+        # Smaller adjustment here since base LR already has batch_size factor
+        # This accounts for gradient accumulation steps and other batch-related interactions
+        if batch_size < reference_batch:
+            # Small boost for smaller batches (they need slightly higher LR per sample)
+            batch_factor = 1.0 + 0.1 * (1 - batch_size / reference_batch)
+        elif batch_size > reference_batch * 2:
+            # Small reduction for very large batches (they're more stable)
+            batch_factor = 1.0 - 0.05 * min(1.0, (batch_size / (reference_batch * 2) - 1))
+        else:
+            batch_factor = 1.0
+        
+        # Cap the batch factor
+        batch_factor = max(0.95, min(1.1, batch_factor))
+        if batch_factor != 1.0:
+            reg_ratio *= batch_factor
+            print(f"  [reg_ratio]   - batch_size fine-tuning ({batch_size}): {batch_factor:.3f}x (base LR already has batch adjustment)", flush=True)
     
     # Model size adjustment (larger models may need different scaling)
     if model_params is not None:

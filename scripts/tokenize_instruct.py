@@ -273,6 +273,100 @@ def replace_wrong_token_in_item(item: dict):
             item[key] = item[key].replace("[PAD]", "")
     return item
 
+
+def calculate_adaptive_dev_size(
+    dataset_size: int = None,
+    hours_to_complete: float = 0,
+    model_params: int = None,
+    avg_seq_length: int = 1024,
+    multi_run_enabled: bool = False
+) -> int:
+    # Step 1: Base size from dataset percentage (if dataset size known)
+    if dataset_size and dataset_size > 0:
+        # Use percentage-based approach with minimums
+        # Standard: 2-5% of dataset, minimum 100 samples for reliability
+        base_percentage = 0.03  # 3% default
+        
+        # Adjust percentage based on dataset size
+        if dataset_size < 1000:
+            base_percentage = 0.1  # 10% for tiny datasets
+        elif dataset_size < 10000:
+            base_percentage = 0.05  # 5% for small datasets
+        elif dataset_size < 100000:
+            base_percentage = 0.03  # 3% for medium datasets
+        elif dataset_size < 1000000:
+            base_percentage = 0.02  # 2% for large datasets
+        else:
+            base_percentage = 0.01  # 1% for very large datasets
+        
+        base_dev_size = max(100, int(dataset_size * base_percentage))
+    else:
+        # Fallback: use time-based fixed sizes (original logic)
+        if hours_to_complete > 0 and hours_to_complete <= 0.5:
+            base_dev_size = 50
+        elif hours_to_complete > 0 and hours_to_complete <= 1.0:
+            base_dev_size = 100
+        elif hours_to_complete > 0 and hours_to_complete <= 2.0:
+            base_dev_size = 150
+        else:
+            base_dev_size = 200
+    
+    # Step 2: Time constraint adjustment (reduce for very short jobs)
+    time_factor = 1.0
+    if hours_to_complete > 0:
+        if hours_to_complete <= 0.5:
+            time_factor = 0.5  # Reduce by 50% for very short jobs
+        elif hours_to_complete <= 0.75:
+            time_factor = 0.7  # Reduce by 30%
+        elif hours_to_complete <= 1.0:
+            time_factor = 0.85  # Reduce by 15%
+        elif hours_to_complete <= 2.0:
+            time_factor = 0.95  # Slight reduction
+        # else: time_factor = 1.0 (no reduction for long jobs)
+    
+    # Step 3: Model size adjustment (larger models need more eval data)
+    model_factor = 1.0
+    if model_params:
+        if model_params > 10_000_000_000:  # > 10B params
+            model_factor = 1.3  # 30% more for very large models
+        elif model_params > 1_000_000_000:  # 1-10B params
+            model_factor = 1.15  # 15% more for large models
+        elif model_params < 100_000_000:  # < 100M params
+            model_factor = 0.9  # 10% less for tiny models
+        # else: model_factor = 1.0 (no adjustment for medium models)
+    
+    # Step 4: Sequence length adjustment (longer sequences = more expensive eval)
+    seq_factor = 1.0
+    if avg_seq_length > 0:
+        if avg_seq_length > 2048:
+            seq_factor = 0.7  # Reduce by 30% for very long sequences
+        elif avg_seq_length > 1024:
+            seq_factor = 0.85  # Reduce by 15% for long sequences
+        elif avg_seq_length < 256:
+            seq_factor = 1.2  # Increase by 20% for short sequences (cheap eval)
+        # else: seq_factor = 1.0 (no adjustment for medium sequences)
+    
+    # Step 5: Multi-run mode adjustment (needs more reliable eval for LR selection)
+    multi_run_factor = 1.0
+    if multi_run_enabled:
+        multi_run_factor = 1.2  # 20% more for multi-run (better LR selection)
+    
+    # Calculate final dev size
+    dev_size = int(base_dev_size * time_factor * model_factor * seq_factor * multi_run_factor)
+    
+    # Ensure reasonable bounds
+    min_dev_size = 50  # Minimum for any meaningful evaluation
+    max_dev_size = 2000  # Maximum to avoid excessive eval overhead
+    
+    # For very large datasets, cap at percentage of dataset
+    if dataset_size and dataset_size > 0:
+        max_dev_size = min(max_dev_size, int(dataset_size * 0.05))  # Never more than 5%
+    
+    dev_size = max(min_dev_size, min(max_dev_size, dev_size))
+    
+    return dev_size
+
+
 def split_dataset(
     total_data_path: str,
     train_data_path: str,
@@ -385,18 +479,46 @@ def main(training_request_path: str):
             f"Max data size is {max_data_size}, so we will only extract {max_data_size} samples randomly"
         )
 
-    # Adaptive dev split for short jobs (tokenization + eval overhead)
+    # Improved adaptive dev split: considers dataset size, model size, sequence length, time, and multi-run mode
     hours_to_complete = float(training_request["train_request"].get("hours_to_complete", 0) or 0)
     dev_size = int(training_request["train_request"].get("dev_size", 0) or 0)
+    
     if dev_size <= 0:
-        if hours_to_complete > 0 and hours_to_complete <= 0.5:
-            dev_size = 50
-        elif hours_to_complete > 0 and hours_to_complete <= 1.0:
-            dev_size = 100
-        elif hours_to_complete > 0 and hours_to_complete <= 2.0:
-            dev_size = 150
-        else:
-            dev_size = 200
+        # First, get dataset size to make percentage-based decisions
+        try:
+            from model_utility import get_data_size
+            dataset_size = get_data_size(total_path)
+        except:
+            dataset_size = None
+        
+        # Get model info for model-size aware split
+        model_name = training_request["train_request"].get("model_name", "")
+        model_params = None
+        try:
+            from model_utility import get_model_num_params
+            model_path = training_request["train_request"].get("model_path", "")
+            if model_path:
+                model_params = get_model_num_params(model_name, model_path)
+        except:
+            pass
+        
+        # Get sequence length (affects eval cost)
+        max_length = training_request["train_request"].get("max_length", 1024)
+        avg_seq_length = max_length  # Use max_length as proxy for avg
+        
+        # Check if multi-run mode is enabled (needs more reliable eval)
+        checking_mode = training_request["train_request"].get("checking_mode", "none")
+        multi_run_enabled = checking_mode in ["first_time", "second_time"]
+        
+        # Calculate adaptive dev size
+        dev_size = calculate_adaptive_dev_size(
+            dataset_size=dataset_size,
+            hours_to_complete=hours_to_complete,
+            model_params=model_params,
+            avg_seq_length=avg_seq_length,
+            multi_run_enabled=multi_run_enabled
+        )
+        print(f"  [Dev Split] Adaptive dev size: {dev_size} (dataset_size={dataset_size}, hours={hours_to_complete:.2f}, model_params={model_params/1e9 if model_params else None:.2f}B, seq_len={avg_seq_length}, multi_run={multi_run_enabled})", flush=True)
 
     split_dataset(
         total_path,
