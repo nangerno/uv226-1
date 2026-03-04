@@ -95,23 +95,57 @@ def extract_value_from_cmd(cmd: str, arg_name: str):
         return None
 
 
-def get_model_architecture(model_name: str) -> str:
+def get_model_architecture(model_name: str, model_path: str = None) -> str:
+    """
+    Get model architecture, trying local path first to avoid network calls.
+    
+    Args:
+        model_name: HuggingFace model ID (e.g., "microsoft/Phi-3-mini-128k-instruct")
+        model_path: Optional local path to the model directory
+    """
+    # First, try local path if provided and exists
+    if model_path and os.path.exists(model_path):
+        try:
+            config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+            architectures = config.architectures
+            if len(architectures) > 1:
+                return "Multiple architectures"
+            return architectures[0].strip().lower()
+        except Exception as e:
+            # If local fails, continue to try remote (but with better error handling)
+            print(f"Failed to load config from local path {model_path}: {e}", flush=True)
+    
+    # Try with model_name (may download from HuggingFace)
+    # Only attempt network call if we have network connectivity
     try:
-        config = AutoConfig.from_pretrained(model_name)
+        config = AutoConfig.from_pretrained(model_name, local_files_only=False)
         architectures = config.architectures
         if len(architectures) > 1:
             return "Multiple architectures"
         return architectures[0].strip().lower()
     except Exception as e:
+        # Handle network errors gracefully - don't fail the entire script
+        error_str = str(e).lower()
+        if any(err in error_str for err in ["name resolution", "failed to resolve", "connection", "network", "dns", "maxretryerror", "temporary failure"]):
+            print(f"Network error when trying to fetch model config for {model_name}: {e}", flush=True)
+            print("Falling back to 'Unknown' architecture (will use defaults). Model config will be loaded later from local path.", flush=True)
+            return "Unknown"
         if "model type `gpt_oss`" in str(e):
             return "GptOssForCausalLM"
+        print(f"Error getting model architecture for {model_name}: {e}", flush=True)
         return "Unknown"
 
 
-def is_openai_model(model_name: str) -> bool:
-    architecture = get_model_architecture(model_name)
+def is_openai_model(model_name: str, model_path: str = None) -> bool:
+    """
+    Check if model is an OpenAI-style model. Returns False if architecture cannot be determined
+    (e.g., due to network issues), to avoid blocking the training process.
+    """
+    architecture = get_model_architecture(model_name, model_path)
     if architecture.lower() == "gptossforcausallm":
         return True
+    # If architecture is Unknown (e.g., due to network error), default to False
+    # The model will be checked again later when the local path is available
     return False
 
 
@@ -285,105 +319,209 @@ def get_log_scale(task_type: str):
     return log_scale_map[task_type]
 
 
+def _calculate_experimental_reg_ratio() -> float:
+    """Calculate reg_ratio using experimental method (empirically determined default)."""
+    return 1.24383
+
+
+def _calculate_sqrt_batch_reg_ratio(batch_size: int, reference_batch: int = 64) -> float:
+    """Calculate reg_ratio using square root batch scaling."""
+    if batch_size is None or batch_size <= 0:
+        return None
+    return np.sqrt(batch_size / reference_batch)
+
+
+def _calculate_linear_batch_reg_ratio(batch_size: int, reference_batch: int = 64) -> float:
+    """Calculate reg_ratio using linear batch scaling."""
+    if batch_size is None or batch_size <= 0:
+        return None
+    return batch_size / reference_batch
+
+
+def _calculate_adaptive_reg_ratio(
+    task_type: str = None,
+    batch_size: int = None,
+    model_params: int = None,
+    base_lr: float = None,
+    hours_to_complete: float = None
+) -> float:
+    """Calculate reg_ratio using adaptive method (combination of factors)."""
+    reg_ratio = 1.0
+    
+    # Time-aware adjustment: Higher LR for short jobs to converge faster
+    if hours_to_complete is not None and hours_to_complete > 0:
+        if hours_to_complete <= 0.5:  # Very short jobs (<30 min)
+            time_factor = 1.5  # Aggressive LR boost
+        elif hours_to_complete <= 0.75:  # Short jobs (<45 min)
+            time_factor = 1.4
+        elif hours_to_complete <= 1.0:  # Medium-short jobs (<1 hour)
+            time_factor = 1.3
+        elif hours_to_complete <= 2.0:  # Medium jobs
+            time_factor = 1.1
+        else:  # Long jobs
+            time_factor = 1.0
+        reg_ratio *= time_factor
+        print(f"  [reg_ratio]   - time_aware adjustment: {hours_to_complete:.2f}h -> factor {time_factor:.2f}", flush=True)
+    
+    # Batch size adjustment (sqrt scaling)
+    if batch_size is not None and batch_size > 0:
+        reference_batch = 64
+        batch_factor = np.sqrt(batch_size / reference_batch)
+        reg_ratio *= batch_factor
+    
+    # Model size adjustment (larger models may need different scaling)
+    if model_params is not None:
+        if model_params > 10_000_000_000:  # > 10B params
+            reg_ratio *= 0.95
+        elif model_params < 1_000_000_000:  # < 1B params
+            reg_ratio *= 1.05
+    
+    # Task type adjustment
+    if task_type:
+        task_adjustments = {
+            TaskType.GRPOTASK.value: 1.0,  # No adjustment
+            TaskType.DPOTASK.value: 1.02,
+            TaskType.INSTRUCTTEXTTASK.value: 1.02,
+            TaskType.CHATTASK.value: 1.02,
+        }
+        task_factor = task_adjustments.get(task_type, 1.0)
+        reg_ratio *= task_factor
+    
+    # Ensure reasonable bounds
+    reg_ratio = max(0.5, min(2.0, reg_ratio))
+    return reg_ratio
+
+
 def calculate_reg_ratio(
     task_type: str = None,
     batch_size: int = None,
     model_params: int = None,
     base_lr: float = None,
-    method: str = "experimental"
+    hours_to_complete: float = None,
+    method: str = "optimized"
 ) -> float:
     """
-    Calculate reg_ratio (learning rate adjustment factor) based on training parameters.
+    Calculate reg_ratio (learning rate adjustment factor) using all available methods
+    and return an optimized value.
     
     Args:
         task_type: Type of task (InstructTextTask, DpoTask, GrpoTask, ChatTask)
         batch_size: Total batch size (per_device_batch_size * num_gpus * gradient_accumulation)
         model_params: Number of model parameters
         base_lr: Base learning rate before reg_ratio adjustment
-        method: Calculation method - "experimental" (default 1.24383), "sqrt_batch" (sqrt scaling),
-                "linear_batch" (linear scaling), or "adaptive" (combination)
+        method: Calculation method - "optimized" (calculate all and choose best, default),
+                "experimental" (default 1.24383), "sqrt_batch", "linear_batch", or "adaptive"
     
     Returns:
         Calculated reg_ratio value
     """
-    if method == "experimental":
-        # Return the empirically determined default value
-        print(f"  [reg_ratio] Using experimental method: returning default value 1.24383", flush=True)
-        return 1.24383
+    print(f"  [reg_ratio] Calculating reg_ratio with method: '{method}'", flush=True)
+    print(f"  [reg_ratio] Available parameters: task_type={task_type}, batch_size={batch_size}, "
+          f"model_params={model_params}, base_lr={base_lr}, hours_to_complete={hours_to_complete}", flush=True)
     
-    elif method == "sqrt_batch":
-        # Square root scaling: reg_ratio = sqrt(batch_size / reference_batch_size)
-        # Reference batch size of 64 is common
-        if batch_size is None or batch_size <= 0:
-            print(f"  [reg_ratio] sqrt_batch method: batch_size={batch_size}, falling back to default 1.24383", flush=True)
+    # If method is not "optimized", use the legacy single-method approach
+    if method != "optimized":
+        if method == "experimental":
+            result = _calculate_experimental_reg_ratio()
+            print(f"  [reg_ratio] experimental method: {result:.6f}", flush=True)
+            return result
+        elif method == "sqrt_batch":
+            result = _calculate_sqrt_batch_reg_ratio(batch_size)
+            if result is None:
+                print(f"  [reg_ratio] sqrt_batch method: batch_size={batch_size}, falling back to default 1.24383", flush=True)
+                return 1.24383
+            print(f"  [reg_ratio] sqrt_batch method: sqrt({batch_size}/64) = {result:.6f}", flush=True)
+            return result
+        elif method == "linear_batch":
+            result = _calculate_linear_batch_reg_ratio(batch_size)
+            if result is None:
+                print(f"  [reg_ratio] linear_batch method: batch_size={batch_size}, falling back to default 1.24383", flush=True)
+                return 1.24383
+            print(f"  [reg_ratio] linear_batch method: {batch_size}/64 = {result:.6f}", flush=True)
+            return result
+        elif method == "adaptive":
+            result = _calculate_adaptive_reg_ratio(task_type, batch_size, model_params, base_lr, hours_to_complete)
+            print(f"  [reg_ratio] adaptive method: {result:.6f}", flush=True)
+            return result
+        else:
+            print(f"  [reg_ratio] Unknown method '{method}', falling back to default 1.24383", flush=True)
             return 1.24383
-        reference_batch = 64
-        calculated = np.sqrt(batch_size / reference_batch)
-        print(f"  [reg_ratio] sqrt_batch method: sqrt({batch_size}/{reference_batch}) = {calculated:.6f}", flush=True)
-        return calculated
     
-    elif method == "linear_batch":
-        # Linear scaling: reg_ratio = batch_size / reference_batch_size
-        if batch_size is None or batch_size <= 0:
-            print(f"  [reg_ratio] linear_batch method: batch_size={batch_size}, falling back to default 1.24383", flush=True)
-            return 1.24383
-        reference_batch = 64
-        calculated = batch_size / reference_batch
-        print(f"  [reg_ratio] linear_batch method: {batch_size}/{reference_batch} = {calculated:.6f}", flush=True)
-        return calculated
+    # Optimized method: calculate all available methods and choose the best value
+    print(f"\n  [reg_ratio] OPTIMIZED MODE: Calculating all available methods...", flush=True)
+    values = {}
+    weights = {}
     
-    elif method == "adaptive":
-        # Adaptive calculation based on multiple factors
-        reg_ratio = 1.0
-        print(f"  [reg_ratio] adaptive method: starting with base=1.0", flush=True)
-        
-        # Batch size adjustment (sqrt scaling)
-        if batch_size is not None and batch_size > 0:
-            reference_batch = 64
-            batch_factor = np.sqrt(batch_size / reference_batch)
-            print(f"  [reg_ratio]   - batch_size adjustment: sqrt({batch_size}/{reference_batch}) = {batch_factor:.6f}", flush=True)
-            reg_ratio *= batch_factor
-            print(f"  [reg_ratio]   - after batch adjustment: {reg_ratio:.6f}", flush=True)
-        
-        # Model size adjustment (larger models may need different scaling)
-        if model_params is not None:
-            if model_params > 10_000_000_000:  # > 10B params
-                adjustment = 0.95
-                print(f"  [reg_ratio]   - model_size adjustment: {model_params/1e9:.1f}B params -> factor {adjustment:.2f}", flush=True)
-                reg_ratio *= adjustment
-            elif model_params < 1_000_000_000:  # < 1B params
-                adjustment = 1.05
-                print(f"  [reg_ratio]   - model_size adjustment: {model_params/1e6:.1f}M params -> factor {adjustment:.2f}", flush=True)
-                reg_ratio *= adjustment
-            else:
-                print(f"  [reg_ratio]   - model_size adjustment: {model_params/1e9:.1f}B params -> no adjustment", flush=True)
-            print(f"  [reg_ratio]   - after model adjustment: {reg_ratio:.6f}", flush=True)
-        
-        # Task type adjustment
-        if task_type:
-            task_adjustments = {
-                TaskType.GRPOTASK.value: 1.0,  # No adjustment
-                TaskType.DPOTASK.value: 1.02,
-                TaskType.INSTRUCTTEXTTASK.value: 1.02,
-                TaskType.CHATTASK.value: 1.02,
-            }
-            task_factor = task_adjustments.get(task_type, 1.0)
-            print(f"  [reg_ratio]   - task_type adjustment: {task_type} -> factor {task_factor:.2f}", flush=True)
-            reg_ratio *= task_factor
-            print(f"  [reg_ratio]   - after task adjustment: {reg_ratio:.6f}", flush=True)
-        
-        # Ensure reasonable bounds
-        original = reg_ratio
-        reg_ratio = max(0.5, min(2.0, reg_ratio))
-        if original != reg_ratio:
-            print(f"  [reg_ratio]   - clamping: {original:.6f} -> {reg_ratio:.6f} (bounds: 0.5-2.0)", flush=True)
-        
-        print(f"  [reg_ratio] adaptive method: final result = {reg_ratio:.6f}", flush=True)
-        return reg_ratio
+    # 1. Experimental method (always available, high weight as baseline)
+    exp_value = _calculate_experimental_reg_ratio()
+    values["experimental"] = exp_value
+    weights["experimental"] = 0.3  # High weight as empirically determined baseline
+    print(f"    - experimental: {exp_value:.6f} (weight: {weights['experimental']:.2f})", flush=True)
     
+    # 2. Sqrt batch method (requires batch_size)
+    sqrt_value = _calculate_sqrt_batch_reg_ratio(batch_size)
+    if sqrt_value is not None:
+        values["sqrt_batch"] = sqrt_value
+        weights["sqrt_batch"] = 0.25
+        print(f"    - sqrt_batch: {sqrt_value:.6f} (weight: {weights['sqrt_batch']:.2f})", flush=True)
     else:
-        # Unknown method, return default
-        return 1.24383
+        print(f"    - sqrt_batch: skipped (batch_size not available)", flush=True)
+    
+    # 3. Linear batch method (requires batch_size)
+    linear_value = _calculate_linear_batch_reg_ratio(batch_size)
+    if linear_value is not None:
+        values["linear_batch"] = linear_value
+        weights["linear_batch"] = 0.15  # Lower weight as linear scaling can be too aggressive
+        print(f"    - linear_batch: {linear_value:.6f} (weight: {weights['linear_batch']:.2f})", flush=True)
+    else:
+        print(f"    - linear_batch: skipped (batch_size not available)", flush=True)
+    
+    # 4. Adaptive method (uses all available parameters)
+    adaptive_value = _calculate_adaptive_reg_ratio(task_type, batch_size, model_params, base_lr, hours_to_complete)
+    values["adaptive"] = adaptive_value
+    weights["adaptive"] = 0.3  # High weight as it considers multiple factors
+    print(f"    - adaptive: {adaptive_value:.6f} (weight: {weights['adaptive']:.2f})", flush=True)
+    
+    # Calculate weighted average
+    total_weight = sum(weights.values())
+    if total_weight == 0 or len(values) == 0:
+        # Safety fallback: should never happen since experimental is always added
+        print(f"    - Warning: No values calculated, using experimental default", flush=True)
+        return exp_value
+    
+    weighted_sum = sum(values[method] * weights[method] for method in values.keys())
+    weighted_avg = weighted_sum / total_weight
+    
+    # Also calculate median for robustness
+    sorted_values = sorted(values.values())
+    n = len(sorted_values)
+    if n == 0:
+        # Safety fallback
+        return exp_value
+    elif n % 2 == 0:
+        median_value = (sorted_values[n//2 - 1] + sorted_values[n//2]) / 2
+    else:
+        median_value = sorted_values[n//2]
+    
+    # Choose optimized value: use weighted average, but ensure it's within reasonable bounds
+    # and close to the median (robustness check)
+    optimized_value = weighted_avg
+    
+    # If weighted average deviates significantly from median, use median instead
+    if abs(optimized_value - median_value) > 0.2:
+        print(f"    - Warning: weighted_avg ({optimized_value:.6f}) deviates from median ({median_value:.6f})", flush=True)
+        optimized_value = median_value
+    
+    # Ensure reasonable bounds
+    optimized_value = max(0.5, min(2.0, optimized_value))
+    
+    print(f"\n  [reg_ratio] OPTIMIZATION RESULTS:", flush=True)
+    print(f"    - All calculated values: {[f'{v:.6f}' for v in sorted(values.values())]}", flush=True)
+    print(f"    - Weighted average: {weighted_avg:.6f}", flush=True)
+    print(f"    - Median: {median_value:.6f}", flush=True)
+    print(f"    - Final optimized value: {optimized_value:.6f}", flush=True)
+    
+    return optimized_value
 
 
 def main():
@@ -446,12 +584,27 @@ def main():
     parser.add_argument(
         "--reg-ratio-method",
         type=str,
-        choices=["experimental", "sqrt_batch", "linear_batch", "adaptive"],
-        help="Method to calculate reg_ratio",
-        default="experimental"
+        choices=["optimized", "experimental", "sqrt_batch", "linear_batch", "adaptive"],
+        help="Method to calculate reg_ratio. 'optimized' calculates all methods and chooses best value (default)",
+        default="optimized"
     )
 
     args = parser.parse_args()
+    original_model_name = args.model
+    original_task_type = args.task_type
+    
+    # Try to get model parameters early for reg_ratio calculation
+    model_params = None
+    try:
+        from model_utility import get_model_num_params
+        # Get model path early if possible
+        model_path = str(train_paths.get_text_base_model_path(original_model_name))
+        if os.path.exists(model_path) or model_path:  # Check if path exists or is a model name
+            model_params = get_model_num_params(original_model_name, model_path)
+            if model_params:
+                print(f"Early model params detection: {model_params/1e9:.2f}B parameters", flush=True)
+    except Exception as e:
+        print(f"Could not get model params early (will use defaults): {e}", flush=True)
     
     # Calculate reg_ratio if not explicitly provided
     print(f"\n{'='*60}", flush=True)
@@ -462,14 +615,16 @@ def main():
         print(f"Task type: {args.task_type}", flush=True)
         args.reg_ratio = calculate_reg_ratio(
             task_type=args.task_type,
+            batch_size=None,  # Will be available later, but optimized method can work without it
+            model_params=model_params,
+            base_lr=None,  # Will be available later
+            hours_to_complete=args.hours_to_complete,
             method=args.reg_ratio_method
         )
         print(f"\n[OK] Final calculated reg_ratio: {args.reg_ratio:.6f}", flush=True)
     else:
         print(f"Using explicitly provided reg_ratio: {args.reg_ratio:.6f}", flush=True)
     print(f"{'='*60}\n", flush=True)
-    original_model_name = args.model
-    original_task_type = args.task_type
 
     # Short-job mode: prioritize getting to GPU training fast and avoid multi-run restarts
     # which add overhead (re-tokenization, repeated training launches, checkpoint churn).
@@ -507,7 +662,7 @@ def main():
     model_path = str(train_paths.get_text_base_model_path(original_model_name))
 
     is_openai = False
-    if is_openai_model(original_model_name):
+    if is_openai_model(original_model_name, model_path):
         print("Upgrading python packages for openai model", flush=True)
         run_cmd_with_log(
             "pip uninstall -y transformers && pip install transformers==4.55.0",

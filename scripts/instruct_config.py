@@ -120,7 +120,7 @@ def get_instruct_config(param_nums: int) -> dict:
     return result
 
 
-def get_run_cmd(config: dict, gpu_nums: int):
+def get_run_cmd(config: dict, gpu_nums: int, train_info: dict = None):
     required_keys = [
         "epoch_num",
         "batch_size",
@@ -144,32 +144,42 @@ def get_run_cmd(config: dict, gpu_nums: int):
     elif run_type == "ds":
         start_cmd = f"deepspeed"
 
+    # Time-aware warmup steps
+    warmup_steps = 35  # Default
+    if train_info:
+        hours_to_complete = float(train_info.get("hours_to_complete", 0) or 0)
+        if hours_to_complete > 0:
+            if hours_to_complete <= 0.75:
+                warmup_steps = 10  # Very short warmup for very short jobs
+            elif hours_to_complete <= 1.5:
+                warmup_steps = 20  # Short warmup for short jobs
+    
     template = (
         start_cmd
-        + """ train_instruct.py \
-    --request_path {request_path} \
+        + f""" train_instruct.py \
+    --request_path {{request_path}} \
     --bf16 True \
     --report_to wandb \
-    --output_dir {output_dir} \
-    --num_train_epochs {epoch_num} \
-    --per_device_train_batch_size {batch_size} \
+    --output_dir {{output_dir}} \
+    --num_train_epochs {{epoch_num}} \
+    --per_device_train_batch_size {{batch_size}} \
     --per_device_eval_batch_size 1 \
-    --gradient_accumulation_steps {gradient_accumulation_steps} \
+    --gradient_accumulation_steps {{gradient_accumulation_steps}} \
     --eval_accumulation_steps 1 \
     --eval_strategy no \
     --save_strategy epoch \
     --logging_steps 5 \
-    --learning_rate {learning_rate} \
+    --learning_rate {{learning_rate}} \
     --weight_decay 0.01 \
-    --warmup_steps 35 \
+    --warmup_steps {warmup_steps} \
     --lr_scheduler_type cosine_with_min_lr \
-    --lr_scheduler_kwargs "{\\"min_lr_rate\\": {min_lr_rate}}" \
+    --lr_scheduler_kwargs "{{\\"min_lr_rate\\": {{min_lr_rate}}}}" \
     --tf32 True \
-    --gradient_checkpointing {gradient_checkpointing} \
-    --optim {optimizer} \
-    --use_liger {use_liger} \
-    --packing {packing} --disable_fa {disable_fa} \
-    --label_smoothing_factor {label_smoothing_factor}"""
+    --gradient_checkpointing {{gradient_checkpointing}} \
+    --optim {{optimizer}} \
+    --use_liger {{use_liger}} \
+    --packing {{packing}} --disable_fa {{disable_fa}} \
+    --label_smoothing_factor {{label_smoothing_factor}}"""
     )
     if run_type == "ds":
         template = template + """ --deepspeed ds_config/zero3.json"""
@@ -225,6 +235,24 @@ def get_training_json(train_info: dict) -> dict:
     hours_to_complete = float(train_info.get("hours_to_complete", 0) or 0)
     if hours_to_complete > 0 and hours_to_complete <= 0.75:
         run_config["packing"] = "False"
+    
+    # Time-aware optimizations for better results in limited time
+    if hours_to_complete > 0:
+        if hours_to_complete <= 0.75:  # Very short jobs
+            # Reduce gradient accumulation for faster updates
+            run_config["gradient_accumulation_steps"] = max(1, run_config["gradient_accumulation_steps"] // 2)
+            # Add label smoothing for better generalization
+            run_config["label_smoothing_factor"] = 0.1
+            # Reduce epochs
+            run_config["epoch_num"] = 1
+            print(f"Time-aware optimization: Very short job ({hours_to_complete:.2f}h) - reduced grad_accum, added label_smoothing, 1 epoch", flush=True)
+        elif hours_to_complete <= 1.5:  # Short jobs
+            run_config["gradient_accumulation_steps"] = max(2, int(run_config["gradient_accumulation_steps"] * 0.75))
+            run_config["label_smoothing_factor"] = 0.05
+            run_config["epoch_num"] = 2
+            print(f"Time-aware optimization: Short job ({hours_to_complete:.2f}h) - adjusted grad_accum, light label_smoothing, 2 epochs", flush=True)
+        else:  # Longer jobs
+            run_config["label_smoothing_factor"] = 0.0  # Keep default
 
     # there are models that do not support packing, so we need to check if the model supports packing
     if run_config["disable_fa"] == "True" or model_architecture.strip().lower() in [
@@ -285,7 +313,7 @@ def get_training_json(train_info: dict) -> dict:
     base_lr = run_config["learning_rate"]
     run_config["learning_rate"] *= train_info["reg_ratio"]
     print(f"Applied reg_ratio: {base_lr:.8f} * {train_info['reg_ratio']:.6f} = {run_config['learning_rate']:.8f}", flush=True)
-    run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
+    run_cmd = get_run_cmd(run_config, run_config["gpu_nums"], train_info)
     train_request = deepcopy(train_info)
     train_request["save_before_remaining_time"] = 3
     train_request["adjust_batch_size"] = False

@@ -33,7 +33,10 @@ def get_model_architecture(model_path: str) -> str:
         if len(architectures) > 1:
             return "Multiple architectures"
         return architectures[0].strip().lower()
-    except:
+    except Exception as e:
+        # Handle special case for gpt_oss models
+        if "model type `gpt_oss`" in str(e):
+            return "gptossforcausallm"
         return "Unknown"
 
 
@@ -162,6 +165,14 @@ def get_gradient_checkpointing(model: str) -> str:
     if "falcon-rw" in model.lower():
         return "False"
     return "True"
+
+
+def is_openai_model(model_name: str) -> bool:
+    """Check if a model is an OpenAI-style model (GptOssForCausalLM architecture)."""
+    architecture = get_model_architecture(model_name)
+    if architecture.lower() == "gptossforcausallm":
+        return True
+    return False
 
 
 def get_data_size(data_path: str) -> int:

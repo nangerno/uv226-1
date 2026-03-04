@@ -64,9 +64,9 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.end_time = end_time
         self._capture_eval_loss_at_checking = False
         self._checking_step_eval_loss = None
-        # DECISIVE: Track top 2 checkpoints for interpolation
+        # DECISIVE: Track top 3 checkpoints for interpolation (improved from 2)
         self.top_checkpoints = []  # List of (step, eval_loss, train_loss, generalization_score)
-        self.max_top_checkpoints = 2
+        self.max_top_checkpoints = 3  # Track top 3 for better ensemble
         # FRESH: Smart checkpoint pruning - track predicted quality
         self.checkpoint_predictions = {}  # step -> predicted_loss
         self.last_eval_loss = None
@@ -365,7 +365,7 @@ class CustomEvalSaveCallback(TrainerCallback):
                 }
                 self.update_best_checkpoint = True
             
-            # DECISIVE: Track top 2 checkpoints for interpolation
+            # DECISIVE: Track top 3 checkpoints for interpolation
             checkpoint_entry = {
                 "step": state.global_step,
                 "eval_loss": eval_loss,
@@ -376,7 +376,7 @@ class CustomEvalSaveCallback(TrainerCallback):
             # Add to top checkpoints list
             self.top_checkpoints.append(checkpoint_entry)
             
-            # Keep only top 2 by generalization_score
+            # Keep only top 3 by generalization_score
             self.top_checkpoints.sort(key=lambda x: x["generalization_score"])
             if len(self.top_checkpoints) > self.max_top_checkpoints:
                 self.top_checkpoints = self.top_checkpoints[:self.max_top_checkpoints]
@@ -470,31 +470,39 @@ class CustomEvalSaveCallback(TrainerCallback):
             best_eval_loss = self.best_checkpoint_info["loss"]
             best_gen_score = self.best_checkpoint_info.get("generalization_score", best_eval_loss)
             
-            # DECISIVE: Checkpoint interpolation - use top 2 checkpoints if available
-            # Only interpolate if we have 2 good checkpoints and time permits
+            # DECISIVE: Checkpoint interpolation - use top 2-3 checkpoints if available
+            # Improved: Use top 3 checkpoints with weighted blending for better generalization
             use_interpolation = (
                 len(self.top_checkpoints) >= 2 
-                and self.top_checkpoints[0]["generalization_score"] < self.top_checkpoints[1]["generalization_score"] * 1.05  # Within 5% of each other
+                and self.top_checkpoints[0]["generalization_score"] < self.top_checkpoints[1]["generalization_score"] * 1.08  # Within 8% of each other
             )
             
             if use_interpolation:
-                print(f"DECISIVE: Interpolating top 2 checkpoints for better generalization", flush=True)
-                ckpt1 = self.top_checkpoints[0]
-                ckpt2 = self.top_checkpoints[1]
-                print(f"  Checkpoint 1: step={ckpt1['step']}, gen_score={ckpt1['generalization_score']:.6f}, eval_loss={ckpt1['eval_loss']:.6f}", flush=True)
-                print(f"  Checkpoint 2: step={ckpt2['step']}, gen_score={ckpt2['generalization_score']:.6f}, eval_loss={ckpt2['eval_loss']:.6f}", flush=True)
+                num_ckpts = min(len(self.top_checkpoints), 3)  # Use up to 3 checkpoints
+                print(f"DECISIVE: Interpolating top {num_ckpts} checkpoints for better generalization", flush=True)
                 
-                # Interpolate weights: 0.6 * best + 0.4 * second_best
-                # (Best checkpoint gets more weight)
-                weight1, weight2 = 0.6, 0.4
+                # Weighted blending: best gets highest weight, others get decreasing weights
+                if num_ckpts == 3:
+                    # Top 3: 50% best, 30% second, 20% third
+                    weights = [0.5, 0.3, 0.2]
+                    ckpts = self.top_checkpoints[:3]
+                elif num_ckpts == 2:
+                    # Top 2: 60% best, 40% second (original weights)
+                    weights = [0.6, 0.4]
+                    ckpts = self.top_checkpoints[:2]
+                else:
+                    weights = [1.0]
+                    ckpts = self.top_checkpoints[:1]
+                
+                for i, ckpt in enumerate(ckpts):
+                    print(f"  Checkpoint {i+1}: step={ckpt['step']}, gen_score={ckpt['generalization_score']:.6f}, eval_loss={ckpt['eval_loss']:.6f}, weight={weights[i]:.2f}", flush=True)
                 
                 try:
-                    # Load both checkpoints
-                    ckpt1_path = os.path.join(self.output_dir, f"checkpoint-{ckpt1['step']}")
-                    ckpt2_path = os.path.join(self.output_dir, f"checkpoint-{ckpt2['step']}")
+                    # Load all checkpoints for interpolation
+                    ckpt_paths = [os.path.join(self.output_dir, f"checkpoint-{ckpt['step']}") for ckpt in ckpts]
                     
-                    # Check if both checkpoints exist
-                    if os.path.exists(ckpt1_path) and os.path.exists(ckpt2_path):
+                    # Check if all checkpoints exist
+                    if all(os.path.exists(path) for path in ckpt_paths):
                         # Load state dicts
                         import glob
                         try:
@@ -505,6 +513,7 @@ class CustomEvalSaveCallback(TrainerCallback):
                             print(f"  Warning: safetensors not available, using .bin files only", flush=True)
                         
                         # Find model files (could be .bin or .safetensors)
+                        ckpt1_path = ckpt_paths[0]
                         ckpt1_files = glob.glob(os.path.join(ckpt1_path, "*.safetensors"))
                         if not ckpt1_files:
                             ckpt1_files = glob.glob(os.path.join(ckpt1_path, "*.bin"))
@@ -513,30 +522,33 @@ class CustomEvalSaveCallback(TrainerCallback):
                             # Copy first checkpoint as base
                             shutil.copytree(ckpt1_path, self.submission_dir)
                             
-                            # Interpolate weights
-                            print(f"  Interpolating weights: {weight1} * ckpt1 + {weight2} * ckpt2", flush=True)
+                            # Interpolate weights: blend all checkpoints
+                            weight_str = " + ".join([f"{w:.2f}*ckpt{i+1}" for i, w in enumerate(weights)])
+                            print(f"  Interpolating weights: {weight_str}", flush=True)
+                            
                             for file_path in ckpt1_files:
                                 filename = os.path.basename(file_path)
-                                file1_path = os.path.join(ckpt1_path, filename)
-                                file2_path = os.path.join(ckpt2_path, filename)
                                 output_path = os.path.join(self.submission_dir, filename)
                                 
-                                if os.path.exists(file2_path):
-                                    # Load both state dicts
-                                    if filename.endswith(".safetensors") and has_safetensors:
-                                        state1 = load_file(file1_path)
-                                        state2 = load_file(file2_path)
-                                    else:
-                                        state1 = torch.load(file1_path, map_location="cpu")
-                                        state2 = torch.load(file2_path, map_location="cpu")
-                                    
-                                    # Interpolate
-                                    interpolated = {}
-                                    for key in state1.keys():
-                                        if key in state2 and state1[key].shape == state2[key].shape:
-                                            interpolated[key] = weight1 * state1[key] + weight2 * state2[key]
+                                # Load all checkpoint state dicts
+                                states = []
+                                for ckpt_path in ckpt_paths:
+                                    file_path_ckpt = os.path.join(ckpt_path, filename)
+                                    if os.path.exists(file_path_ckpt):
+                                        if filename.endswith(".safetensors") and has_safetensors:
+                                            states.append(load_file(file_path_ckpt))
                                         else:
-                                            interpolated[key] = state1[key]  # Use ckpt1 if key missing in ckpt2
+                                            states.append(torch.load(file_path_ckpt, map_location="cpu"))
+                                
+                                if len(states) == len(weights):
+                                    # Interpolate: weighted sum of all checkpoints
+                                    interpolated = {}
+                                    for key in states[0].keys():
+                                        # Check if all states have this key with same shape
+                                        if all(key in state and state[key].shape == states[0][key].shape for state in states):
+                                            interpolated[key] = sum(weights[i] * states[i][key] for i in range(len(states)))
+                                        else:
+                                            interpolated[key] = states[0][key]  # Use first checkpoint if key missing
                                     
                                     # Save interpolated weights
                                     if filename.endswith(".safetensors") and has_safetensors:
@@ -544,8 +556,10 @@ class CustomEvalSaveCallback(TrainerCallback):
                                     else:
                                         torch.save(interpolated, output_path)
                             
-                            print(f"  Successfully interpolated checkpoints", flush=True)
-                            interpolation_info = f"interpolated:step1={ckpt1['step']},step2={ckpt2['step']},w1={weight1},w2={weight2}"
+                            print(f"  Successfully interpolated {num_ckpts} checkpoints", flush=True)
+                            step_info = ",".join([f"step{i+1}={ckpt['step']}" for i, ckpt in enumerate(ckpts)])
+                            weight_info = ",".join([f"w{i+1}={w:.2f}" for i, w in enumerate(weights)])
+                            interpolation_info = f"interpolated:{step_info},{weight_info}"
                         else:
                             # Fallback: just use best checkpoint
                             print(f"  Warning: Could not find model files, using best checkpoint only", flush=True)
@@ -746,9 +760,22 @@ class EarlyStoppingCallback(TrainerCallback):
     Early stopping callback to prevent overfitting.
     Stops training when eval_loss doesn't improve for 'patience' evaluations.
     Works with both standard eval_loss and GRPO's eval_reward (negated).
+    Supports adaptive patience based on time constraints.
     """
-    def __init__(self, patience: int = 300, min_delta: float = 0.0001):
-        self.patience = patience
+    def __init__(self, patience: int = 300, min_delta: float = 0.0001, hours_to_complete: float = None):
+        # Adaptive patience: reduce for short jobs to stop faster and save time
+        if hours_to_complete is not None and hours_to_complete > 0:
+            if hours_to_complete <= 0.75:  # Very short jobs
+                self.patience = 50  # Very aggressive early stopping
+            elif hours_to_complete <= 1.5:  # Short jobs
+                self.patience = 100
+            elif hours_to_complete <= 2.0:  # Medium jobs
+                self.patience = 200
+            else:  # Long jobs
+                self.patience = patience  # Use provided patience
+            print(f"Adaptive early stopping: patience={self.patience} for {hours_to_complete:.2f}h job", flush=True)
+        else:
+            self.patience = patience
         self.min_delta = min_delta
         self.best_loss = None
         self.wait = 0

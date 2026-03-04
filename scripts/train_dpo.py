@@ -313,7 +313,7 @@ def main():
                 end_time=train_request["end_time"],
                 checking_mode=train_request.get("checking_mode", "none")
             ),
-            EarlyStoppingCallback(patience=300, min_delta=0.0001)
+            EarlyStoppingCallback(patience=300, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
         ],
     )
     
