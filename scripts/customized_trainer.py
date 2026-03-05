@@ -46,7 +46,10 @@ class CustomEvalSaveCallback(TrainerCallback):
         checking_step: int = 100,
         total_steps_all_epochs: int = -1,
         end_time: str = "",
-        checking_mode: str = "none"
+        checking_mode: str = "none",
+        task_type: str = None,
+        update_lr_lookup: bool = True,
+        metadata: Optional[Dict] = None
     ):
         self.function_when_to_evaluate = function_when_to_evaluate
         self.submission_dir = submission_dir
@@ -62,6 +65,9 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.total_steps_all_epochs = total_steps_all_epochs
         self.checking_mode = checking_mode
         self.end_time = end_time
+        self.task_type = task_type  # For LR lookup update
+        self.update_lr_lookup = update_lr_lookup  # Flag to enable/disable automatic updates
+        self.metadata = metadata or {}  # Additional metadata for LR lookup
         self._capture_eval_loss_at_checking = False
         self._checking_step_eval_loss = None
         # DECISIVE: Track top 3 checkpoints for interpolation (improved from 2)
@@ -615,6 +621,111 @@ class CustomEvalSaveCallback(TrainerCallback):
             # add a loss.txt file to the submission directory
             with open(os.path.join(self.submission_dir, "loss.txt"), "w") as f:
                 f.write(f"{self.best_checkpoint_info['step']},{best_eval_loss},{best_gen_score},{interpolation_info}")
+    
+    def on_train_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        """
+        Called when training ends. Extract final metrics and update LR lookup table automatically.
+        """
+        if not is_main_process(LOCAL_RANK):
+            return
+        
+        # Only update if enabled and task_type is provided
+        if not self.update_lr_lookup or not self.task_type:
+            return
+        
+        # Extract final metrics from training state
+        final_eval_loss = None
+        final_train_loss = None
+        
+        # Try to get final eval_loss from log_history
+        if state.log_history:
+            # Look for the last evaluation entry
+            for log_entry in reversed(state.log_history):
+                if "eval_loss" in log_entry:
+                    final_eval_loss = log_entry["eval_loss"]
+                    break
+                # For GRPO, check eval_reward
+                if "eval_reward" in log_entry:
+                    final_eval_loss = -log_entry["eval_reward"]  # Convert reward to loss
+                    break
+            
+            # Get final train_loss
+            for log_entry in reversed(state.log_history):
+                if "loss" in log_entry and "eval_loss" not in log_entry:
+                    final_train_loss = log_entry["loss"]
+                    break
+        
+        # If we have best checkpoint info, use that for eval_loss (more reliable)
+        if self.best_checkpoint_info and "loss" in self.best_checkpoint_info:
+            if final_eval_loss is None:
+                final_eval_loss = self.best_checkpoint_info["loss"]
+        
+        # Get learning rate from training args
+        learning_rate = getattr(args, "learning_rate", None)
+        if learning_rate is None:
+            # Try to get from log_history
+            if state.log_history:
+                for log_entry in reversed(state.log_history):
+                    if "learning_rate" in log_entry:
+                        learning_rate = log_entry["learning_rate"]
+                        break
+        
+        # Skip update if we don't have essential information
+        if learning_rate is None:
+            print(f"  [LR Update] Skipping: No learning rate found", flush=True)
+            return
+        
+        if final_eval_loss is None and final_train_loss is None:
+            print(f"  [LR Update] Skipping: No loss metrics found", flush=True)
+            return
+        
+        # Map task type to lookup table format
+        task_type_map = {
+            "InstructTextTask": "instruct",
+            "ChatTask": "instruct",  # Chat uses same lookup as instruct
+            "DpoTask": "dpo",
+            "GrpoTask": "grpo",
+        }
+        
+        lookup_task_type = task_type_map.get(self.task_type)
+        if not lookup_task_type:
+            print(f"  [LR Update] Skipping: Unknown task type '{self.task_type}'", flush=True)
+            return
+        
+        # Prepare metadata
+        metadata = self.metadata.copy()
+        metadata.update({
+            "final_step": state.global_step,
+            "best_checkpoint_step": self.best_checkpoint_info.get("step") if self.best_checkpoint_info else None,
+            "total_steps": self.total_steps_all_epochs,
+        })
+        
+        # Update LR lookup table
+        try:
+            from lrs_lookup import update_lr_lookup
+            
+            updated = update_lr_lookup(
+                task_type=lookup_task_type,
+                model=self.original_model_name,
+                learning_rate=learning_rate,
+                eval_loss=final_eval_loss,
+                train_loss=final_train_loss,
+                metadata=metadata
+            )
+            
+            if updated:
+                print(f"  [LR Update] Successfully updated LR lookup table for {self.original_model_name[:50]}...", flush=True)
+                print(f"  [LR Update]   - LR: {learning_rate:.8f}", flush=True)
+                if final_eval_loss:
+                    print(f"  [LR Update]   - Eval Loss: {final_eval_loss:.6f}", flush=True)
+                if final_train_loss:
+                    print(f"  [LR Update]   - Train Loss: {final_train_loss:.6f}", flush=True)
+            else:
+                print(f"  [LR Update] Lookup table not updated (existing entry has better or equal loss)", flush=True)
+        except Exception as e:
+            print(f"  [LR Update] Error updating LR lookup table: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
 
 
 class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):

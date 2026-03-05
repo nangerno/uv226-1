@@ -393,6 +393,36 @@ def main():
     if checking_step >= total_steps_per_epoch:
         checking_step = total_steps_per_epoch - 2
     
+    # Get model architecture and params for metadata
+    model_architecture = None
+    model_params = None
+    try:
+        from model_utility import get_model_architecture, get_model_num_params
+        model_architecture = get_model_architecture(train_request["model_path"])
+        model_params = get_model_num_params(train_request["model_name"], train_request["model_path"])
+    except:
+        pass
+    
+    # Prepare metadata for LR lookup update
+    metadata = {
+        "batch_size": training_args.per_device_train_batch_size,
+        "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+        "gpu_count": training_args.world_size,
+        "use_lora": lora_args.lora_r > 0 if hasattr(lora_args, 'lora_r') else False,
+        "lora_rank": getattr(lora_args, 'lora_r', None),
+        "max_length": train_request.get("max_length"),
+        "epochs": training_args.num_train_epochs,
+        "warmup_steps": training_args.warmup_steps,
+        "hours_to_complete": train_request.get("hours_to_complete"),
+        "architecture": model_architecture,
+        "model_params": model_params,
+        "reg_ratio": train_info.get("reg_ratio"),  # Get from train_info if available
+    }
+    
+    # Determine task type (InstructTextTask or ChatTask)
+    task_type = "InstructTextTask"  # Default
+    # Could check train_request for task_type if available, or infer from dataset_type
+    
     trainer = Trainer(
         model=model,
         processing_class=tokenizer,  # Changed from tokenizer to processing_class (deprecated parameter)
@@ -409,7 +439,10 @@ def main():
                 checking_step=checking_step,
                 total_steps_all_epochs=total_steps_all_epochs,
                 end_time=train_request["end_time"],
-                checking_mode=train_request.get("checking_mode", "none")
+                checking_mode=train_request.get("checking_mode", "none"),
+                task_type=task_type,
+                update_lr_lookup=train_request.get("find_lk_lr", True),  # Use find_lk_lr flag to control updates
+                metadata=metadata
             ),
             EarlyStoppingCallback(patience=300, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
         ],

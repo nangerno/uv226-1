@@ -2,6 +2,7 @@ import json
 import os 
 import hashlib
 from typing import Optional, Dict, Any
+from datetime import datetime, timezone
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
 # File paths for LR lookup tables
@@ -142,7 +143,8 @@ def update_lr_lookup(
     if should_update:
         new_entry = {
             "h": hashed_model,
-            "lr": learning_rate
+            "lr": learning_rate,
+            "timestamp": datetime.now(timezone.utc).isoformat()  # Add timestamp for tracking
         }
         
         # Add loss information if available
@@ -151,9 +153,18 @@ def update_lr_lookup(
         if train_loss is not None:
             new_entry["train_loss"] = train_loss
         
-        # Add metadata if provided
+        # Add metadata if provided (flatten important fields to top level for easier access)
         if metadata:
             new_entry["metadata"] = metadata
+            # Also store key metadata fields at top level for easier filtering/matching
+            if "batch_size" in metadata:
+                new_entry["batch_size"] = metadata["batch_size"]
+            if "use_lora" in metadata:
+                new_entry["use_lora"] = metadata["use_lora"]
+            if "lora_rank" in metadata:
+                new_entry["lora_rank"] = metadata["lora_rank"]
+            if "hours_to_complete" in metadata:
+                new_entry["hours_to_complete"] = metadata["hours_to_complete"]
         
         # Update or add entry
         if existing_index >= 0:

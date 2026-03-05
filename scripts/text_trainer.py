@@ -96,13 +96,6 @@ def extract_value_from_cmd(cmd: str, arg_name: str):
 
 
 def get_model_architecture(model_name: str, model_path: str = None) -> str:
-    """
-    Get model architecture, trying local path first to avoid network calls.
-    
-    Args:
-        model_name: HuggingFace model ID (e.g., "microsoft/Phi-3-mini-128k-instruct")
-        model_path: Optional local path to the model directory
-    """
     # First, try local path if provided and exists
     if model_path and os.path.exists(model_path):
         try:
@@ -309,14 +302,86 @@ def delete_poor_checkpoints(train_runs: list[dict]):
                     shutil.rmtree(run["output_dir"])
 
 
-def get_log_scale(task_type: str):
-    log_scale_map = {
+def calculate_adaptive_log_range(
+    task_type: str,
+    current_lr: float = None,
+    model_params: int = None,
+    dataset_size: int = None,
+    hours_to_complete: float = None,
+    n_runs: int = None,
+    first_run_loss: float = None
+) -> float:
+    # Step 1: Base range from task type
+    base_log_range_map = {
         TaskType.INSTRUCTTEXTTASK.value: 0.18,
         TaskType.DPOTASK.value: 0.18,
         TaskType.GRPOTASK.value: 0.2,
         TaskType.CHATTASK.value: 0.18,
     }
-    return log_scale_map[task_type]
+    log_range = base_log_range_map.get(task_type, 0.18)
+    
+    # Step 2: Model size adjustment (larger models need narrower search)
+    if model_params:
+        if model_params > 10_000_000_000:  # > 10B params
+            log_range *= 0.85  # Narrower search for very large models
+        elif model_params > 1_000_000_000:  # 1-10B params
+            log_range *= 0.9  # Slightly narrower
+        elif model_params < 100_000_000:  # < 100M params
+            log_range *= 1.1  # Wider search for tiny models
+        # else: no adjustment for medium models
+    
+    # Step 3: Dataset size adjustment (larger datasets can tolerate wider search)
+    if dataset_size and dataset_size > 0:
+        if dataset_size > 1_000_000:  # Very large datasets
+            log_range *= 1.1  # Wider search
+        elif dataset_size > 100_000:  # Large datasets
+            log_range *= 1.05  # Slightly wider
+        elif dataset_size < 10_000:  # Small datasets
+            log_range *= 0.95  # Narrower search
+        # else: no adjustment for medium datasets
+    
+    # Step 4: Time budget adjustment (shorter jobs need narrower search)
+    if hours_to_complete and hours_to_complete > 0:
+        if hours_to_complete <= 0.5:  # Very short jobs
+            log_range *= 0.7  # Much narrower (30% reduction)
+        elif hours_to_complete <= 0.75:  # Short jobs
+            log_range *= 0.8  # Narrower (20% reduction)
+        elif hours_to_complete <= 1.0:  # Medium-short jobs
+            log_range *= 0.9  # Slightly narrower (10% reduction)
+        elif hours_to_complete <= 2.0:  # Medium jobs
+            log_range *= 0.95  # Slightly narrower (5% reduction)
+        # else: no adjustment for long jobs
+    
+    # Step 5: Number of runs adjustment (more runs = can afford wider search)
+    if n_runs and n_runs > 0:
+        if n_runs >= 5:  # Many runs
+            log_range *= 1.1  # Wider search
+        elif n_runs >= 3:  # Medium runs
+            log_range *= 1.05  # Slightly wider
+        elif n_runs == 2:  # Only 2 runs
+            log_range *= 0.9  # Narrower search
+        # else: no adjustment for 1 run (shouldn't happen in multi-run)
+    
+    # Step 6: First run loss adjustment (high loss might need wider search)
+    if first_run_loss and first_run_loss > 0:
+        # If loss is very high (>2.0), might need wider search
+        if first_run_loss > 2.0:
+            log_range *= 1.1  # Wider search
+        elif first_run_loss > 1.5:
+            log_range *= 1.05  # Slightly wider
+        elif first_run_loss < 0.5:  # Very low loss
+            log_range *= 0.95  # Narrower search (already good)
+        # else: no adjustment for normal loss
+    
+    # Ensure reasonable bounds (too narrow = no exploration, too wide = unstable)
+    log_range = max(0.1, min(0.3, log_range))
+    
+    return log_range
+
+
+def get_log_scale(task_type: str, **kwargs):
+    # Always use adaptive calculation (will use base task-specific values if no params provided)
+    return calculate_adaptive_log_range(task_type, **kwargs)
 
 
 def _calculate_experimental_reg_ratio() -> float:
@@ -753,6 +818,20 @@ def main():
     state = get_state()
     state = {}
     set_state(state) # reset first
+    
+    # Store model_params and dataset_size in state for adaptive log_range calculation
+    if model_params:
+        state["model_params"] = model_params
+    # Try to get dataset size after tokenization
+    try:
+        from model_utility import get_data_size
+        if request_path and os.path.exists(request_path):
+            dataset_size = get_data_size(request_path)
+            if dataset_size:
+                state["dataset_size"] = dataset_size
+    except:
+        pass
+    
     state["mode"] = "initial"
     # at first the state is always running the train_cmd
 
@@ -776,7 +855,27 @@ def main():
                 n_runs = state["next_runs"]
                 if "lrs" not in state: # first time of continue
                     current_lr = float(state["train"]["lr"])
-                    state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
+                    
+                    # Get adaptive parameters for log_range calculation
+                    # Try to get from state first (stored during initial setup)
+                    model_params = state.get("model_params", model_params)  # Fallback to global
+                    dataset_size = state.get("dataset_size", None)
+                    first_run_loss = state.get("train", {}).get("current_loss", None)
+                    
+                    # Calculate adaptive log_range
+                    adaptive_log_range = get_log_scale(
+                        args.task_type,
+                        current_lr=current_lr,
+                        model_params=model_params,
+                        dataset_size=dataset_size,
+                        hours_to_complete=args.hours_to_complete,
+                        n_runs=n_runs,
+                        first_run_loss=first_run_loss
+                    )
+                    
+                    print(f"  [LR Search] Adaptive log_range: {adaptive_log_range:.4f} (base: {get_log_scale(args.task_type):.4f}, model_params={model_params/1e9 if model_params else None:.2f}B, dataset_size={dataset_size}, n_runs={n_runs}, hours={args.hours_to_complete:.2f})", flush=True)
+                    
+                    state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=adaptive_log_range)
                     assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
                     state["runs"] = []
                 

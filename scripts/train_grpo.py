@@ -459,6 +459,33 @@ def main():
     sample_data = dev_ds.to_list()[:10] if len(dev_ds) > 10 else None
     wrapped_reward_funcs = get_reward_funcs(train_request["dataset_type"], sample_data, has_extra_column)
     
+    # Get model architecture and params for metadata
+    model_architecture = None
+    model_params = None
+    try:
+        from model_utility import get_model_architecture, get_model_num_params
+        model_architecture = get_model_architecture(train_request["model_path"])
+        model_params = get_model_num_params(train_request["model_name"], train_request["model_path"])
+    except:
+        pass
+    
+    # Prepare metadata for LR lookup update
+    metadata = {
+        "batch_size": training_args.per_device_train_batch_size,
+        "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+        "gpu_count": training_args.world_size,
+        "use_lora": peft_config is not None,
+        "lora_rank": getattr(peft_config, 'r', None) if peft_config else None,
+        "max_length": train_request.get("max_length"),
+        "epochs": training_args.num_train_epochs,
+        "warmup_steps": training_args.warmup_steps,
+        "hours_to_complete": train_request.get("hours_to_complete"),
+        "use_vllm": train_request.get("use_vllm", False),
+        "architecture": model_architecture,
+        "model_params": model_params,
+        "reg_ratio": train_info.get("reg_ratio") if "reg_ratio" in train_info else None,
+    }
+    
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=wrapped_reward_funcs,
@@ -477,7 +504,10 @@ def main():
                 checking_step=checking_step,
                 total_steps_all_epochs=total_steps_all_epochs,
                 end_time=train_request["end_time"],
-                checking_mode=train_request.get("checking_mode", "none")
+                checking_mode=train_request.get("checking_mode", "none"),
+                task_type="GrpoTask",
+                update_lr_lookup=train_request.get("find_lk_lr", False),  # GRPO typically doesn't use lookup
+                metadata=metadata
             ),
             EarlyStoppingCallback(patience=300, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
         ],
