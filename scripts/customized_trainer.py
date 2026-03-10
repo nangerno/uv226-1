@@ -10,6 +10,7 @@ import os
 from typing import Callable, Optional, Dict
 import shutil
 import json
+import math
 from transformers.trainer_utils import is_main_process
 import wandb
 import torch
@@ -259,13 +260,22 @@ class CustomEvalSaveCallback(TrainerCallback):
             
             self.last_eval_loss = eval_loss
         
-        # CRITICAL: Store eval_loss at checking_step for multi-run selection
+        # CRITICAL: Store eval_loss and train_loss at checking_step for multi-run selection
         if hasattr(self, '_capture_eval_loss_at_checking') and self._capture_eval_loss_at_checking:
             if state.global_step == self.checking_step and self.checking_mode == "second_time":
                 if eval_loss is not None:
+                    # Extract train_loss from log_history for storage
+                    train_loss_for_storage = None
+                    if state.log_history:
+                        last_log = state.log_history[-1]
+                        train_loss_for_storage = last_log.get("loss", None)
+                    
                     my_state = get_state()
                     my_state["train"]["current_eval_loss"] = eval_loss
-                    print(f"CRITICAL: Stored eval_loss {eval_loss:.6f} at checking_step {state.global_step} for multi-run selection", flush=True)
+                    # IMPROVED: Also store train_loss for generalization_score calculation
+                    if train_loss_for_storage is not None:
+                        my_state["train"]["current_train_loss"] = train_loss_for_storage
+                    print(f"CRITICAL: Stored eval_loss {eval_loss:.6f} and train_loss {train_loss_for_storage:.6f if train_loss_for_storage else None} at checking_step {state.global_step} for multi-run selection", flush=True)
                     
                     # Now make decision based on eval_loss instead of train_loss
                     current_is_the_best = False
@@ -317,13 +327,23 @@ class CustomEvalSaveCallback(TrainerCallback):
                     
                     return control
         
-        # Monitor train/eval gap for overfitting detection
+        # IMPROVED: Monitor train/eval gap for overfitting detection and early stopping
+        overfitting_detected = False
         if state.log_history:
             last_train_loss = state.log_history[-1].get("loss", None)
             if last_train_loss and eval_loss:
                 gap_ratio = eval_loss / last_train_loss if last_train_loss > 0 else float('inf')
                 if gap_ratio > 2.0:  # Eval loss is 2x train loss = overfitting
+                    overfitting_detected = True
                     print(f"WARNING: Overfitting detected! Train loss: {last_train_loss:.6f}, Eval loss: {eval_loss:.6f}, Ratio: {gap_ratio:.2f}", flush=True)
+                    
+                    # IMPROVED: More aggressive early stopping when severe overfitting detected
+                    if gap_ratio > 2.5 and self.best_checkpoint_info is not None:
+                        best_eval = self.best_checkpoint_info.get("loss", float('inf'))
+                        if eval_loss > best_eval * 1.1:  # Current eval is 10% worse than best
+                            print(f"SEVERE OVERFITTING: Stopping early to prevent further degradation (gap_ratio={gap_ratio:.2f}, eval_loss={eval_loss:.6f} vs best={best_eval:.6f})", flush=True)
+                            control.should_training_stop = True
+                            return control
         
         # DECISIVE: Overfitting-aware checkpoint selection
         # Track train_loss to compute generalization_score
@@ -335,18 +355,32 @@ class CustomEvalSaveCallback(TrainerCallback):
         # Cross-entropy loss optimization: track best cross-entropy loss
         # eval_loss is already cross-entropy, so we use it directly
         if eval_loss is not None:
-            # DECISIVE: Compute generalization_score to penalize overfitting
-            # generalization_score = eval_loss - penalty * overfitting_gap
+            # IMPROVED: Compute generalization_score with adaptive overfitting penalty
+            # generalization_score = eval_loss - adaptive_penalty * overfitting_gap
             # Lower score is better (we want low eval_loss and low overfitting)
             generalization_score = eval_loss
             overfitting_penalty = 0.0
             if train_loss is not None and train_loss > 0:
                 overfitting_gap = max(0, eval_loss - train_loss)
-                # Penalize overfitting: if eval_loss is much higher than train_loss, penalize it
-                # Use 0.3 as penalty factor (tuned for tournament)
-                overfitting_penalty = 0.3 * overfitting_gap
+                gap_ratio = eval_loss / train_loss if train_loss > 0 else float('inf')
+                
+                # IMPROVED: Adaptive penalty factor based on gap severity
+                # Small gap (< 1.2x): light penalty (0.2)
+                # Medium gap (1.2-1.5x): moderate penalty (0.35)
+                # Large gap (1.5-2.0x): strong penalty (0.5)
+                # Very large gap (> 2.0x): very strong penalty (0.7)
+                if gap_ratio >= 2.0:
+                    penalty_factor = 0.7  # Very strong penalty for severe overfitting
+                elif gap_ratio >= 1.5:
+                    penalty_factor = 0.5  # Strong penalty
+                elif gap_ratio >= 1.2:
+                    penalty_factor = 0.35  # Moderate penalty
+                else:
+                    penalty_factor = 0.2  # Light penalty for small gaps
+                
+                overfitting_penalty = penalty_factor * overfitting_gap
                 generalization_score = eval_loss - overfitting_penalty
-                print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss={train_loss:.6f}, overfitting_gap={overfitting_gap:.6f}, generalization_score={generalization_score:.6f}", flush=True)
+                print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss={train_loss:.6f}, gap_ratio={gap_ratio:.3f}, overfitting_gap={overfitting_gap:.6f}, penalty_factor={penalty_factor:.2f}, generalization_score={generalization_score:.6f}", flush=True)
             else:
                 print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss=None, generalization_score={generalization_score:.6f}", flush=True)
             
@@ -487,18 +521,40 @@ class CustomEvalSaveCallback(TrainerCallback):
                 num_ckpts = min(len(self.top_checkpoints), 3)  # Use up to 3 checkpoints
                 print(f"DECISIVE: Interpolating top {num_ckpts} checkpoints for better generalization", flush=True)
                 
-                # Weighted blending: best gets highest weight, others get decreasing weights
-                if num_ckpts == 3:
-                    # Top 3: 50% best, 30% second, 20% third
-                    weights = [0.5, 0.3, 0.2]
-                    ckpts = self.top_checkpoints[:3]
-                elif num_ckpts == 2:
-                    # Top 2: 60% best, 40% second (original weights)
-                    weights = [0.6, 0.4]
-                    ckpts = self.top_checkpoints[:2]
+                # IMPROVED: Exponential weighting based on generalization_score differences
+                # Better checkpoints get exponentially higher weights
+                ckpts = self.top_checkpoints[:num_ckpts]
+                best_score = ckpts[0]["generalization_score"]
+                
+                # Calculate exponential weights: exp(-alpha * score_diff)
+                # alpha controls how quickly weights decay (higher = more emphasis on best)
+                alpha = 10.0  # Tuned for good balance
+                raw_weights = []
+                for ckpt in ckpts:
+                    score_diff = ckpt["generalization_score"] - best_score
+                    # Normalize: weight = exp(-alpha * normalized_score_diff)
+                    # Use relative difference to handle different loss scales
+                    # Add safeguard: if best_score is very small, use absolute difference with cap
+                    if best_score > 0.01:  # Use relative normalization if score is reasonable
+                        normalized_diff = score_diff / best_score
+                    else:
+                        # For very small scores, use absolute difference with cap to prevent extreme weights
+                        normalized_diff = min(score_diff, 1.0)  # Cap at 1.0 to prevent extreme weights
+                    weight = math.exp(-alpha * max(0, normalized_diff))
+                    raw_weights.append(weight)
+                
+                # Normalize weights to sum to 1
+                total_weight = sum(raw_weights)
+                if total_weight > 0:
+                    weights = [w / total_weight for w in raw_weights]
                 else:
-                    weights = [1.0]
-                    ckpts = self.top_checkpoints[:1]
+                    # Fallback to fixed weights if calculation fails
+                    if num_ckpts == 3:
+                        weights = [0.5, 0.3, 0.2]
+                    elif num_ckpts == 2:
+                        weights = [0.6, 0.4]
+                    else:
+                        weights = [1.0]
                 
                 for i, ckpt in enumerate(ckpts):
                     print(f"  Checkpoint {i+1}: step={ckpt['step']}, gen_score={ckpt['generalization_score']:.6f}, eval_loss={ckpt['eval_loss']:.6f}, weight={weights[i]:.2f}", flush=True)
@@ -700,6 +756,21 @@ class CustomEvalSaveCallback(TrainerCallback):
             "total_steps": self.total_steps_all_epochs,
         })
         
+        # CRITICAL: Add batch_size and effective_batch_size for joint LR-batch optimization
+        if hasattr(args, "per_device_train_batch_size"):
+            metadata["batch_size"] = args.per_device_train_batch_size
+            # Calculate effective batch size (per_device * gpu_count * grad_accum)
+            gpu_count = getattr(args, "world_size", 1)
+            grad_accum = getattr(args, "gradient_accumulation_steps", 1)
+            metadata["effective_batch_size"] = args.per_device_train_batch_size * gpu_count * grad_accum
+        elif "batch_size" not in metadata:
+            # Fallback: try to get from metadata if already set
+            pass
+        
+        # Add learning_rate to metadata if not already present
+        if "learning_rate" not in metadata:
+            metadata["learning_rate"] = learning_rate
+        
         # Update LR lookup table
         try:
             from lrs_lookup import update_lr_lookup
@@ -716,6 +787,23 @@ class CustomEvalSaveCallback(TrainerCallback):
             if updated:
                 print(f"  [LR Update] Successfully updated LR lookup table for {self.original_model_name[:50]}...", flush=True)
                 print(f"  [LR Update]   - LR: {learning_rate:.8f}", flush=True)
+            
+            # AutoML: Also update hyperparameter lookup table
+            try:
+                from hyperparam_optimizer import update_hyperparams
+                from model_utility import get_model_num_params
+                
+                param_nums = get_model_num_params(self.original_model_name, "")
+                update_hyperparams(
+                    task_type=lookup_task_type,
+                    model=self.original_model_name,
+                    param_nums=param_nums,
+                    eval_loss=final_eval_loss,
+                    train_loss=final_train_loss,
+                    metadata=metadata
+                )
+            except Exception as e:
+                print(f"  [AutoML] Warning: Could not update hyperparameter lookup: {e}", flush=True)
                 if final_eval_loss:
                     print(f"  [LR Update]   - Eval Loss: {final_eval_loss:.6f}", flush=True)
                 if final_train_loss:
@@ -795,27 +883,32 @@ class WhenToEvalHandler:
         if self.steps_per_epoch != -1 and global_step % self.steps_per_epoch == 0 and global_step > 1:
             return {"eval": True, "reason": "epoch"}
         
-        # DECISIVE: Adaptive evaluation frequency - more frequent near end
+        # IMPROVED: Adaptive evaluation frequency - more frequent near end and when overfitting likely
         # FRESH: Time-aware - adjust frequency based on remaining time
         if self.max_steps != -1 and self.max_steps > 0:
             progress = global_step / self.max_steps
             
+            # IMPROVED: More frequent evaluation in later stages to catch best checkpoint
             # In tight time mode, evaluate more frequently to catch best checkpoint quickly
             if self.time_aware_mode == "tight":
                 if progress > 0.7:  # Last 30% of training
-                    if global_step % 30 == 0 and global_step > 1:  # Very frequent
+                    if global_step % 25 == 0 and global_step > 1:  # Very frequent (improved from 30)
                         return {"eval": True, "reason": "periodic_frequent_tight"}
                 elif progress > 0.5:  # Last 50% of training
-                    if global_step % 50 == 0 and global_step > 1:
+                    if global_step % 40 == 0 and global_step > 1:  # Improved from 50
                         return {"eval": True, "reason": "periodic_frequent_tight"}
             elif progress > 0.8:  # Last 20% of training
-                # Evaluate every 50 steps (very frequent to catch best checkpoint)
-                if global_step % 50 == 0 and global_step > 1:
+                # Evaluate every 40 steps (improved from 50 - more frequent)
+                if global_step % 40 == 0 and global_step > 1:
                     return {"eval": True, "reason": "periodic_frequent"}
             elif progress > 0.6:  # Last 40% of training
-                # Evaluate every 100 steps (moderately frequent)
-                if global_step % 100 == 0 and global_step > 1:
+                # Evaluate every 80 steps (improved from 100 - more frequent)
+                if global_step % 80 == 0 and global_step > 1:
                     return {"eval": True, "reason": "periodic_frequent"}
+            elif progress > 0.4:  # IMPROVED: Also evaluate more frequently in mid-training
+                # Evaluate every 150 steps (moderately frequent)
+                if global_step % 150 == 0 and global_step > 1:
+                    return {"eval": True, "reason": "periodic_mid"}
         
         if self.periodic_save_steps != -1 and global_step % self.periodic_save_steps == 0 and global_step > 1:
             return {"eval": True, "reason": "periodic"}
@@ -867,12 +960,6 @@ def init_wandb(train_request: Dict):
 
 
 class EarlyStoppingCallback(TrainerCallback):
-    """
-    Early stopping callback to prevent overfitting.
-    Stops training when eval_loss doesn't improve for 'patience' evaluations.
-    Works with both standard eval_loss and GRPO's eval_reward (negated).
-    Supports adaptive patience based on time constraints.
-    """
     def __init__(self, patience: int = 300, min_delta: float = 0.0001, hours_to_complete: float = None):
         # Adaptive patience: reduce for short jobs to stop faster and save time
         if hours_to_complete is not None and hours_to_complete > 0:

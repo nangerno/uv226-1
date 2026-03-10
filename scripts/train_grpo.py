@@ -1,4 +1,7 @@
 from typing import Dict, Optional
+import os
+# Set CUDA memory allocation config before importing torch to reduce fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import requests
 import json
 import random

@@ -8,6 +8,7 @@ from model_utility import (
 )
 from copy import deepcopy
 from lrs_lookup import get_instruct_lr
+from hyperparam_optimizer import get_optimal_warmup_steps, get_optimal_gradient_accumulation
 import math
 
 
@@ -118,7 +119,8 @@ def calculate_continuous_lr(
     lora_rank: int = 16,
     hours_to_complete: float = None,
     batch_size: int = None,
-    gpu_count: int = None
+    gpu_count: int = None,
+    verbose: bool = True
 ) -> float:
     # Base LR for 1B parameter model
     base_lr_1b = 1e-4
@@ -139,7 +141,7 @@ def calculate_continuous_lr(
         arch_lower = architecture.strip().lower()
         arch_coef = ARCHITECTURE_LR_COEFFICIENTS.get(arch_lower, 1.0)
         lr *= arch_coef
-        if arch_coef != 1.0:
+        if verbose and arch_coef != 1.0:
             print(f"  [LR] Architecture adjustment ({arch_lower}): {arch_coef:.3f}x", flush=True)
     
     # Dataset size adjustment: larger datasets can tolerate higher LR
@@ -150,7 +152,8 @@ def calculate_continuous_lr(
         # Cap the factor to avoid extreme values
         dataset_factor = min(1.5, max(0.7, dataset_factor))
         lr *= dataset_factor
-        print(f"  [LR] Dataset size adjustment ({dataset_size:,} samples): {dataset_factor:.3f}x", flush=True)
+        if verbose:
+            print(f"  [LR] Dataset size adjustment ({dataset_size:,} samples): {dataset_factor:.3f}x", flush=True)
     
     # Sequence length adjustment: longer sequences often need lower LR
     # Inverse sqrt scaling: 1 / sqrt(avg_seq_length / 512)
@@ -160,7 +163,8 @@ def calculate_continuous_lr(
         # Cap the factor
         seq_factor = min(1.3, max(0.8, seq_factor))
         lr *= seq_factor
-        print(f"  [LR] Sequence length adjustment (avg {avg_seq_length}): {seq_factor:.3f}x", flush=True)
+        if verbose:
+            print(f"  [LR] Sequence length adjustment (avg {avg_seq_length}): {seq_factor:.3f}x", flush=True)
     
     # LoRA adjustment: higher rank = more parameters = slightly higher effective LR
     if use_lora and lora_rank > 0:
@@ -168,7 +172,8 @@ def calculate_continuous_lr(
         lora_factor = math.sqrt(lora_rank / 16.0)
         lora_factor = min(1.2, max(0.9, lora_factor))  # Cap between 0.9x and 1.2x
         lr *= lora_factor
-        print(f"  [LR] LoRA adjustment (rank {lora_rank}): {lora_factor:.3f}x", flush=True)
+        if verbose:
+            print(f"  [LR] LoRA adjustment (rank {lora_rank}): {lora_factor:.3f}x", flush=True)
     
     # Batch size adjustment: larger batch sizes can use higher LR
     # This is applied in base LR calculation for better batch-aware optimization
@@ -191,7 +196,8 @@ def calculate_continuous_lr(
         batch_factor = max(0.7, min(1.5, batch_factor))
         if batch_factor != 1.0:
             lr *= batch_factor
-            print(f"  [LR] Batch size adjustment (effective batch {effective_batch}): {batch_factor:.3f}x", flush=True)
+            if verbose:
+                print(f"  [LR] Batch size adjustment (effective batch {effective_batch}): {batch_factor:.3f}x", flush=True)
     
     # Time constraint adjustment: higher LR for time-constrained training to converge faster
     # This is applied in base LR calculation (not just in reg_ratio) for better time-aware optimization
@@ -209,7 +215,8 @@ def calculate_continuous_lr(
         
         if time_factor != 1.0:
             lr *= time_factor
-            print(f"  [LR] Time constraint adjustment ({hours_to_complete:.2f}h): {time_factor:.2f}x", flush=True)
+            if verbose:
+                print(f"  [LR] Time constraint adjustment ({hours_to_complete:.2f}h): {time_factor:.2f}x", flush=True)
     
     # Ensure reasonable bounds
     lr = max(1e-6, min(1e-3, lr))
@@ -224,11 +231,16 @@ def get_instruct_config(param_nums: int, use_continuous_lr: bool = True) -> dict
     Args:
         param_nums: Number of model parameters
         use_continuous_lr: If True, use continuous LR scaling; if False, use legacy buckets
+    
+    Note: LR calculation is optimized - only calculates base LR here without full context.
+    Full LR calculation with all factors happens later in get_training_json().
     """
-    # Use continuous LR calculation by default
+    # OPTIMIZATION: Only calculate minimal base LR here, full calculation happens later
+    # This avoids duplicate expensive calculations
     if use_continuous_lr:
-        # Calculate LR using continuous scaling
-        base_lr = calculate_continuous_lr(param_nums)
+        # Calculate minimal base LR (just param-based, without other factors, verbose=False to reduce output)
+        # Full calculation with all factors happens in get_training_json()
+        base_lr = calculate_continuous_lr(param_nums, verbose=False)
         
         # Determine other config based on model size (still use buckets for these)
         # but we'll use continuous LR instead
@@ -260,7 +272,7 @@ def get_instruct_config(param_nums: int, use_continuous_lr: bool = True) -> dict
         
         result = deepcopy(base_config)
         result["lr"] = base_lr
-        print(f"  [LR] Continuous scaling: {param_nums/1e9:.2f}B params -> {base_lr:.8f}", flush=True)
+        # Note: Detailed LR logging happens in get_training_json() after full calculation
     else:
         # Legacy bucket-based approach
         result = {
@@ -323,15 +335,34 @@ def get_run_cmd(config: dict, gpu_nums: int, train_info: dict = None):
     elif run_type == "ds":
         start_cmd = f"deepspeed"
 
-    # Time-aware warmup steps
-    warmup_steps = 35  # Default
+    # AutoML: Get optimal warmup steps (learns from history, falls back to heuristics)
+    warmup_steps = 35  # Default fallback
     if train_info:
+        model_name = train_info.get("model_name", "")
+        model_path = train_info.get("model_path", "")
+        param_nums = get_model_num_params(model_name, model_path) if model_name else 0
+        dataset_size = None
+        try:
+            request_path = train_info.get("request_path")
+            if request_path:
+                dataset_size = get_data_size(request_path)
+        except:
+            pass
+        
         hours_to_complete = float(train_info.get("hours_to_complete", 0) or 0)
-        if hours_to_complete > 0:
-            if hours_to_complete <= 0.75:
-                warmup_steps = 10  # Very short warmup for very short jobs
-            elif hours_to_complete <= 1.5:
-                warmup_steps = 20  # Short warmup for short jobs
+        # Get learning rate from config (which is already calculated)
+        learning_rate = config.get("lr")
+        
+        # Use AutoML optimizer to get optimal warmup steps
+        warmup_steps = get_optimal_warmup_steps(
+            model=model_name,
+            task_type="instruct",
+            param_nums=param_nums,
+            dataset_size=dataset_size,
+            learning_rate=learning_rate,
+            hours_to_complete=hours_to_complete if hours_to_complete > 0 else None,
+            default_warmup=35
+        )
     
     template = (
         start_cmd
@@ -340,6 +371,7 @@ def get_run_cmd(config: dict, gpu_nums: int, train_info: dict = None):
     --bf16 True \
     --report_to wandb \
     --output_dir {{output_dir}} \
+    --run_name {{run_name}} \
     --num_train_epochs {{epoch_num}} \
     --per_device_train_batch_size {{batch_size}} \
     --per_device_eval_batch_size 1 \
@@ -399,6 +431,15 @@ def get_training_json(train_info: dict) -> dict:
     if "max_length" in train_info.get("train_request", {}):
         avg_seq_length = train_info["train_request"]["max_length"]
     
+    # OPTIMIZATION: Check lookup table FIRST to avoid expensive calculations if LR is already known
+    use_lookup_lr = False
+    lookup_lr = None
+    if train_info.get("find_lk_lr", False):
+        lookup_lr = get_instruct_lr(model_name)
+        if lookup_lr is not None:
+            use_lookup_lr = True
+            print(f"  [LR] Found in lookup table: {lookup_lr:.8f}", flush=True)
+    
     # Use continuous LR calculation with dataset and architecture awareness
     config = get_instruct_config(param_nums, use_continuous_lr=True)
     
@@ -416,30 +457,86 @@ def get_training_json(train_info: dict) -> dict:
         config["batch_size"] = initial_batch_size
         print(f"  [Batch Size] Base multiplier ({base_multiplier}x) applied, base batch size: {initial_batch_size}", flush=True)
     
-    # Recalculate LR with full context (architecture, dataset, sequence length, time constraints, batch size)
-    use_lora = config.get("use_lora", False)
-    lora_rank = train_info.get("train_request", {}).get("lora_r", 16) if use_lora else 16
+    # Only calculate LR if not using lookup table (optimization: skip expensive calculation)
+    if use_lookup_lr:
+        calculated_lr = lookup_lr
+        print(f"  [LR] Using lookup table LR, skipping continuous calculation", flush=True)
+    else:
+        # Recalculate LR with full context (architecture, dataset, sequence length, time constraints, batch size)
+        use_lora = config.get("use_lora", False)
+        lora_rank = train_info.get("train_request", {}).get("lora_r", 16) if use_lora else 16
+        
+        calculated_lr = calculate_continuous_lr(
+            param_nums=param_nums,
+            architecture=model_architecture,
+            dataset_size=dataset_size,
+            avg_seq_length=avg_seq_length,
+            use_lora=use_lora,
+            lora_rank=lora_rank,
+            hours_to_complete=hours_to_complete,
+            batch_size=initial_batch_size,
+            gpu_count=gpu_count
+        )
+        print(f"  [LR] Calculated continuous LR: {calculated_lr:.8f}", flush=True)
     
-    calculated_lr = calculate_continuous_lr(
-        param_nums=param_nums,
-        architecture=model_architecture,
-        dataset_size=dataset_size,
-        avg_seq_length=avg_seq_length,
-        use_lora=use_lora,
-        lora_rank=lora_rank,
-        hours_to_complete=hours_to_complete,
-        batch_size=initial_batch_size,
-        gpu_count=gpu_count
-    )
+    # DECISIVE IMPROVEMENT: Joint LR-batch size optimization based on test loss
+    # Priority 1: Time-aware optimization (test loss per unit time) if time-constrained
+    # Priority 2: General test loss optimization
+    from hyperparam_optimizer import get_optimal_lr_batch_pair, scale_lr_for_batch_size, optimize_for_test_loss_per_time
     
-    # Use the calculated LR (will be overridden by lookup table if available)
+    initial_batch_size_for_lr = config.get("batch_size")
+    optimal_lr, optimal_batch, opt_reason = None, None, None
+    
+    # If time-constrained, prioritize time-aware optimization
+    if hours_to_complete and hours_to_complete > 0:
+        optimal_lr, optimal_batch, opt_reason = optimize_for_test_loss_per_time(
+            model=model_name,
+            task_type="instruct",
+            param_nums=param_nums,
+            dataset_size=dataset_size,
+            hours_to_complete=hours_to_complete,
+            gpu_count=gpu_count
+        )
+    
+    # Fallback to general optimization if time-aware didn't find anything
+    if optimal_lr is None or optimal_batch is None:
+        optimal_lr, optimal_batch, opt_reason = get_optimal_lr_batch_pair(
+            model=model_name,
+            task_type="instruct",
+            param_nums=param_nums,
+            dataset_size=dataset_size,
+            hours_to_complete=hours_to_complete if hours_to_complete > 0 else None,
+            gpu_count=gpu_count,
+            base_lr=calculated_lr if not use_lookup_lr else lookup_lr,
+            base_batch_size=initial_batch_size_for_lr,
+            min_batch_size=1,
+            max_batch_size=128
+        )
+    
+    if optimal_lr is not None and optimal_batch is not None:
+        # Use optimal pair from history
+        calculated_lr = optimal_lr
+        config["batch_size"] = optimal_batch
+        print(f"  [AutoML] Using optimal LR-batch pair: LR={optimal_lr:.8f}, batch={optimal_batch} ({opt_reason})", flush=True)
+    else:
+        # Use calculated values
+        print(f"  [AutoML] No optimal pair found, using calculated values: LR={calculated_lr:.8f}, batch={initial_batch_size_for_lr}", flush=True)
+    
+    # Use the calculated or lookup LR
     config["lr"] = calculated_lr
+    
+    # Generate unique run_name to avoid WandB warning about run_name matching output_dir
+    run_name = train_info.get("wandb_name") or train_info.get("wandb_runid") or f"train_{train_info.get('task_id', 'unknown')}"
+    
+    # Track initial batch size for LR scaling if batch size changes later
+    initial_effective_batch = config["batch_size"] * gpu_count
+    initial_lr = config["lr"]
     
     run_config = {
         "epoch_num": 3,
         "batch_size": config["batch_size"],
         "learning_rate": config["lr"],
-        "min_lr_rate": 0.25,
+        "min_lr_rate": 0.15,
         "use_liger": get_use_liger(model_architecture),
         "optimizer": "paged_adamw_8bit",
         "use_lora": config.get("use_lora", False),
@@ -447,6 +544,7 @@ def get_training_json(train_info: dict) -> dict:
         "packing": "True",
         "gpu_nums": config["gpu_count"],
         "output_dir": train_info["output_dir"],
+        "run_name": run_name,
         "request_path": train_info["request_path"],
         "distributed": config.get("distributed", "ddp"),
         "gradient_checkpointing": "True",
@@ -582,23 +680,48 @@ def get_training_json(train_info: dict) -> dict:
         else:
             run_config["batch_size"] = int(run_config["batch_size"] / 2)
 
+    # CRITICAL: Scale LR when batch size changes (maintains training stability)
+    # This must be done AFTER all batch size adjustments are complete
+    final_effective_batch = run_config["batch_size"] * run_config["gpu_nums"]
+    if final_effective_batch != initial_effective_batch:
+        from hyperparam_optimizer import scale_lr_for_batch_size
+        scaled_lr = scale_lr_for_batch_size(
+            base_lr=initial_lr,
+            old_batch_size=initial_effective_batch,
+            new_batch_size=final_effective_batch,
+            param_nums=param_nums,
+            scaling_rule="adaptive"
+        )
+        run_config["learning_rate"] = scaled_lr
+        config["lr"] = scaled_lr
+        print(f"  [LR Scaling] Batch size changed from {initial_effective_batch} to {final_effective_batch}, scaled LR from {initial_lr:.8f} to {scaled_lr:.8f}", flush=True)
+
+    # AutoML: Get optimal gradient accumulation (optimizes for target batch size)
     data_per_step = run_config["batch_size"] * run_config["gpu_nums"]
     if data_per_step >= 64:
         run_config["gradient_accumulation_steps"] = 1
     else:
-        run_config["gradient_accumulation_steps"] = int(64 / data_per_step)
+        # Use AutoML optimizer for smarter gradient accumulation
+        run_config["gradient_accumulation_steps"] = get_optimal_gradient_accumulation(
+            model=model_name,
+            task_type="instruct",
+            param_nums=param_nums,
+            batch_size=run_config["batch_size"],
+            gpu_count=run_config["gpu_nums"],
+            target_total_batch=64,
+            max_grad_accum=8
+        )
 
     if model_architecture.strip().lower() in ["gptossforcausallm"]:
         run_config["use_lora"] = False  # currently, gptoss does not support lora
 
-    if train_info["find_lk_lr"]:
-        # get lr from lrs_lookup.py
-        lr = get_instruct_lr(model_name)
-        if lr is not None:
-            print(f"Using lr from lk: {lr}", flush=True)
-            run_config["learning_rate"] = lr
-        else:
-            print(f"Using lr from config: {run_config['learning_rate']}", flush=True)
+    # OPTIMIZATION: Lookup LR was already checked and used above, so no need to check again
+    # The LR in run_config is already set from config["lr"] which uses lookup if available
+    # (Note: use_lookup_lr is set in the block above, so we can check train_info directly here)
+    if train_info.get("find_lk_lr", False) and lookup_lr is not None:
+        print(f"  [LR] Using lookup table LR: {run_config['learning_rate']:.8f}", flush=True)
+    else:
+        print(f"  [LR] Using calculated LR: {run_config['learning_rate']:.8f}", flush=True)
 
     base_lr = run_config["learning_rate"]
     run_config["learning_rate"] *= train_info["reg_ratio"]

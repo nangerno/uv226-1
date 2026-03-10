@@ -7,6 +7,8 @@ import argparse
 import asyncio
 import json
 import os
+# Set CUDA memory allocation config before importing torch to reduce fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import shutil
 import copy
 import subprocess
@@ -173,11 +175,27 @@ def run_training(
     task_type: str,
     expected_repo_name: str,
 ):
+    # OPTIMIZATION: More aggressive memory management before training
     try:
         import torch
+        import gc
         if torch.cuda.is_available():
+            # Python garbage collection first
+            gc.collect()
+            # Clear PyTorch CUDA cache
             torch.cuda.empty_cache()
-            print(f"************* Clear GPU cache before starting training to avoid memory fragmentation *************", flush=True)
+            # Synchronize to ensure all operations complete
+            torch.cuda.synchronize()
+            # Optional: reset peak memory stats for better tracking
+            torch.cuda.reset_peak_memory_stats()
+            
+            # Log memory status for diagnostics
+            if torch.cuda.device_count() > 0:
+                allocated = torch.cuda.memory_allocated(0) / 1024**3  # GB
+                reserved = torch.cuda.memory_reserved(0) / 1024**3  # GB
+                total = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+                print(f"************* Clear GPU cache before starting training to avoid memory fragmentation *************", flush=True)
+                print(f"  [Memory] GPU 0: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {total:.2f}GB total", flush=True)
             
     except:
         print(f"************* GPU is not allowed *************", flush=True)    
@@ -186,6 +204,18 @@ def run_training(
     for i in range(retries):
         print(f"************* Training attempt {i+1}/{retries} for task {task_id}*************", flush=True)
         if i > 0:  # there was something wrong so we will reduce the batch_size
+            # OPTIMIZATION: More aggressive memory cleanup before retry
+            try:
+                import torch
+                import gc
+                if torch.cuda.is_available():
+                    gc.collect()  # Python garbage collection first
+                    torch.cuda.empty_cache()  # Clear PyTorch cache
+                    torch.cuda.synchronize()  # Wait for all operations to complete
+                    print(f"  [Memory] Aggressive cleanup before retry {i+1}/{retries}", flush=True)
+            except:
+                pass
+            
             # first check if the training is OOM
             if os.path.exists(log_path):
                 error_type = get_error_type(log_path)
@@ -195,9 +225,22 @@ def run_training(
                     )
                     current_batch_size = int(current_batch_size)
                     if current_batch_size > 1:
-                        new_batch_size = current_batch_size // 2
+                        # OPTIMIZATION: Smarter batch size reduction based on retry count
+                        # First retry: reduce by 50%, subsequent retries: reduce by 40% (more conservative)
+                        if i == 1:
+                            # First retry: halve it
+                            reduction_factor = 0.5
+                        elif i == 2:
+                            # Second retry: reduce by 40% (more conservative)
+                            reduction_factor = 0.6
+                        else:
+                            # Third+ retry: reduce by 30% (very conservative)
+                            reduction_factor = 0.7
+                        
+                        new_batch_size = max(1, int(current_batch_size * reduction_factor))
                         print(
-                            f"Reducing batch size from {current_batch_size} to {new_batch_size}",
+                            f"  [OOM Recovery] Reducing batch size from {current_batch_size} to {new_batch_size} "
+                            f"(retry {i+1}/{retries}, reduction: {int((1-reduction_factor)*100)}%)",
                             flush=True,
                         )
                         train_cmd = replace_args_in_cmd(
@@ -207,16 +250,16 @@ def run_training(
                         )
                         # print(f"New train command: {train_cmd}", flush=True)
                     else:
-                        print(f"batch size is 1, cannot reduce further", flush=True)
+                        print(f"  [OOM Recovery] Batch size is 1, cannot reduce further", flush=True)
                         if task_type == TaskType.GRPOTASK.value:
                             # disable vllm
                             train_cmd = replace_args_in_cmd(
                                 train_cmd, "use_vllm", "False"
                             )
-                            # print(f"disable VLLM {train_cmd}", flush=True)
+                            print(f"  [OOM Recovery] Disabled VLLM as last resort", flush=True)
                 elif error_type == VLLM_OOM_ERROR:
                     if task_type == TaskType.GRPOTASK.value:
-                        print(f"VLLM OOM error, disable VLLM", flush=True)
+                        print(f"  [OOM Recovery] VLLM OOM error, disabling VLLM", flush=True)
                         train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
 
         # empty the log file if it exists
@@ -309,18 +352,114 @@ def calculate_adaptive_log_range(
     dataset_size: int = None,
     hours_to_complete: float = None,
     n_runs: int = None,
-    first_run_loss: float = None
+    first_run_loss: float = None,
+    model_name: str = None,
+    request_path: str = None
 ) -> float:
-    # Step 1: Base range from task type
-    base_log_range_map = {
-        TaskType.INSTRUCTTEXTTASK.value: 0.18,
-        TaskType.DPOTASK.value: 0.18,
-        TaskType.GRPOTASK.value: 0.2,
-        TaskType.CHATTASK.value: 0.18,
-    }
-    log_range = base_log_range_map.get(task_type, 0.18)
+    """
+    Calculate optimal log_range for LR search in ALL cases.
+    Tries to fetch missing parameters and uses AutoML to get the most optimized value.
+    """
+    # ALWAYS fetch missing parameters FIRST to ensure AutoML can use them
+    if model_params is None and model_name:
+        try:
+            from model_utility import get_model_num_params
+            import training_paths
+            model_path = str(training_paths.get_text_base_model_path(model_name))
+            if model_path:
+                model_params = get_model_num_params(model_name, model_path)
+                if model_params:
+                    print(f"  [log_range] Fetched model_params: {model_params/1e9:.2f}B", flush=True)
+        except Exception as e:
+            print(f"  [log_range] Could not fetch model_params: {e}", flush=True)
     
-    # Step 2: Model size adjustment (larger models need narrower search)
+    if dataset_size is None and request_path:
+        try:
+            from model_utility import get_data_size
+            if os.path.exists(request_path):
+                dataset_size = get_data_size(request_path)
+                if dataset_size:
+                    print(f"  [log_range] Fetched dataset_size: {dataset_size}", flush=True)
+        except Exception as e:
+            print(f"  [log_range] Could not fetch dataset_size: {e}", flush=True)
+    
+    # OPTIMIZATION: Try to get optimal log_range from historical performance
+    optimal_log_range = None
+    try:
+        from hyperparam_optimizer import hash_model_and_config, _hyperparams_dict, _hyperparams_list
+        if model_name and model_params:
+            # Map task_type to hyperparam_optimizer task_type format
+            task_type_map = {
+                TaskType.INSTRUCTTEXTTASK.value: "instruct",
+                TaskType.CHATTASK.value: "instruct",  # Chat uses instruct config
+                TaskType.DPOTASK.value: "dpo",
+                TaskType.GRPOTASK.value: "grpo",
+            }
+            opt_task_type = task_type_map.get(task_type, "instruct")
+            
+            config_hash = hash_model_and_config(model_name, opt_task_type, model_params, dataset_size)
+            
+            # CRITICAL: Exclude GRPO from test loss-based optimization (GRPO uses reward, not loss)
+            # Search for historical entries with best test loss (eval_loss)
+            best_entry = None
+            best_loss = float('inf')
+            
+            # Check exact match first
+            if config_hash in _hyperparams_dict and opt_task_type != "grpo":
+                entry = _hyperparams_dict[config_hash]
+                # CRITICAL: Prioritize eval_loss (test loss) for all tasks except GRPO
+                entry_loss = entry.get("eval_loss")
+                if entry_loss is not None:
+                    best_entry = entry
+                    best_loss = entry_loss
+            
+            # Search similar configs (within 20% model size)
+            if not best_entry and model_params > 0 and opt_task_type != "grpo":
+                for entry in _hyperparams_list:
+                    entry_params = entry.get("param_nums", 0)
+                    if entry_params > 0:
+                        param_ratio = min(model_params, entry_params) / max(model_params, entry_params)
+                        if param_ratio >= 0.8 and entry.get("task_type") == opt_task_type:
+                            # CRITICAL: Prioritize eval_loss (test loss) for all tasks except GRPO
+                            entry_loss = entry.get("eval_loss")
+                            if entry_loss is not None and entry_loss < best_loss:
+                                best_loss = entry_loss
+                                best_entry = entry
+            
+            # If we found a good historical entry, infer optimal log_range
+            # Lower test loss = better LR was found, so we can use narrower search
+            # Higher test loss = need wider search to find better LR
+            if best_entry:
+                historical_loss = best_entry.get("eval_loss", float('inf'))
+                # If historical loss is very good (< 0.5), use narrower search (found good LR)
+                # If historical loss is high (> 1.5), use wider search (need to explore more)
+                if historical_loss < 0.5:
+                    optimal_log_range = 0.12  # Narrow search (already found good LR)
+                elif historical_loss < 1.0:
+                    optimal_log_range = 0.15  # Medium search
+                elif historical_loss < 1.5:
+                    optimal_log_range = 0.18  # Standard search
+                else:
+                    optimal_log_range = 0.22  # Wider search (need better LR)
+                
+                print(f"  [AutoML] Using learned log_range: {optimal_log_range:.4f} from historical test_loss={historical_loss:.6f}", flush=True)
+    except Exception as e:
+        # Fall back to heuristics if AutoML lookup fails
+        print(f"  [AutoML] Could not get optimal log_range from history: {e}, using heuristics", flush=True)
+    
+    # Step 1: Base range from task type (or use optimal from history)
+    if optimal_log_range is not None:
+        log_range = optimal_log_range
+    else:
+        base_log_range_map = {
+            TaskType.INSTRUCTTEXTTASK.value: 0.18,
+            TaskType.DPOTASK.value: 0.18,
+            TaskType.GRPOTASK.value: 0.2,
+            TaskType.CHATTASK.value: 0.18,
+        }
+        log_range = base_log_range_map.get(task_type, 0.18)
+    
+    # Step 2: Model size adjustment (ALWAYS apply if model_params available)
     if model_params:
         if model_params > 10_000_000_000:  # > 10B params
             log_range *= 0.85  # Narrower search for very large models
@@ -329,8 +468,11 @@ def calculate_adaptive_log_range(
         elif model_params < 100_000_000:  # < 100M params
             log_range *= 1.1  # Wider search for tiny models
         # else: no adjustment for medium models
+    else:
+        # Default adjustment if model_params unknown (assume medium model)
+        pass
     
-    # Step 3: Dataset size adjustment (larger datasets can tolerate wider search)
+    # Step 3: Dataset size adjustment (ALWAYS apply if dataset_size available)
     if dataset_size and dataset_size > 0:
         if dataset_size > 1_000_000:  # Very large datasets
             log_range *= 1.1  # Wider search
@@ -339,8 +481,11 @@ def calculate_adaptive_log_range(
         elif dataset_size < 10_000:  # Small datasets
             log_range *= 0.95  # Narrower search
         # else: no adjustment for medium datasets
+    else:
+        # Default adjustment if dataset_size unknown (assume medium dataset)
+        pass
     
-    # Step 4: Time budget adjustment (shorter jobs need narrower search)
+    # Step 4: Time budget adjustment (ALWAYS apply if hours_to_complete available)
     if hours_to_complete and hours_to_complete > 0:
         if hours_to_complete <= 0.5:  # Very short jobs
             log_range *= 0.7  # Much narrower (30% reduction)
@@ -351,8 +496,11 @@ def calculate_adaptive_log_range(
         elif hours_to_complete <= 2.0:  # Medium jobs
             log_range *= 0.95  # Slightly narrower (5% reduction)
         # else: no adjustment for long jobs
+    else:
+        # Default: assume medium time budget if unknown
+        pass
     
-    # Step 5: Number of runs adjustment (more runs = can afford wider search)
+    # Step 5: Number of runs adjustment (ALWAYS apply if n_runs available)
     if n_runs and n_runs > 0:
         if n_runs >= 5:  # Many runs
             log_range *= 1.1  # Wider search
@@ -361,8 +509,12 @@ def calculate_adaptive_log_range(
         elif n_runs == 2:  # Only 2 runs
             log_range *= 0.9  # Narrower search
         # else: no adjustment for 1 run (shouldn't happen in multi-run)
+    else:
+        # Default: assume 2-3 runs if unknown (medium runs = slightly wider)
+        # But be conservative and use no adjustment to avoid over-optimization
+        pass
     
-    # Step 6: First run loss adjustment (high loss might need wider search)
+    # Step 6: First run loss adjustment (ALWAYS apply if first_run_loss available)
     if first_run_loss and first_run_loss > 0:
         # If loss is very high (>2.0), might need wider search
         if first_run_loss > 2.0:
@@ -372,6 +524,9 @@ def calculate_adaptive_log_range(
         elif first_run_loss < 0.5:  # Very low loss
             log_range *= 0.95  # Narrower search (already good)
         # else: no adjustment for normal loss
+    else:
+        # Default: assume medium loss if unknown
+        pass
     
     # Ensure reasonable bounds (too narrow = no exploration, too wide = unstable)
     log_range = max(0.1, min(0.3, log_range))
@@ -379,9 +534,18 @@ def calculate_adaptive_log_range(
     return log_range
 
 
-def get_log_scale(task_type: str, **kwargs):
-    # Always use adaptive calculation (will use base task-specific values if no params provided)
-    return calculate_adaptive_log_range(task_type, **kwargs)
+def get_log_scale(task_type: str, model_name: str = None, request_path: str = None, **kwargs):
+    """
+    Get optimal log_range for LR search.
+    Always calculates in all cases, fetching missing parameters and using AutoML optimization.
+    """
+    # Always use adaptive calculation with full context
+    return calculate_adaptive_log_range(
+        task_type, 
+        model_name=model_name,
+        request_path=request_path,
+        **kwargs
+    )
 
 
 def _calculate_experimental_reg_ratio() -> float:
@@ -462,16 +626,78 @@ def _calculate_adaptive_reg_ratio(
         elif model_params < 1_000_000_000:  # < 1B params
             reg_ratio *= 1.05
     
-    # Task type adjustment
+    # Task type adjustment - IMPROVED: Use AutoML to learn optimal adjustments from historical performance
     if task_type:
-        task_adjustments = {
+        # Reference values (fallback when no historical data available)
+        reference_task_factors = {
             TaskType.GRPOTASK.value: 1.0,  # No adjustment
             TaskType.DPOTASK.value: 1.02,
             TaskType.INSTRUCTTEXTTASK.value: 1.02,
             TaskType.CHATTASK.value: 1.02,
         }
-        task_factor = task_adjustments.get(task_type, 1.0)
-        reg_ratio *= task_factor
+        task_factor = reference_task_factors.get(task_type, 1.0)
+        
+        # OPTIMIZATION: Try to learn optimal task adjustment from historical reg_ratio performance
+        try:
+            from hyperparam_optimizer import _hyperparams_list
+            
+            # Map task_type to hyperparam_optimizer task_type format
+            task_type_map = {
+                TaskType.INSTRUCTTEXTTASK.value: "instruct",
+                TaskType.CHATTASK.value: "instruct",  # Chat uses instruct config
+                TaskType.DPOTASK.value: "dpo",
+                TaskType.GRPOTASK.value: "grpo",
+            }
+            opt_task_type = task_type_map.get(task_type, "instruct")
+            
+            # Find best performing reg_ratio for this task type from history
+            # CRITICAL: Exclude GRPO from test loss-based optimization (GRPO uses reward, not loss)
+            if model_params and model_params > 0 and opt_task_type != "grpo":
+                best_reg_ratio = None
+                best_loss = float('inf')
+                
+                # Search for entries with same task type and similar model size
+                for entry in _hyperparams_list:
+                    if entry.get("task_type") == opt_task_type:
+                        entry_params = entry.get("param_nums", 0)
+                        entry_reg_ratio = entry.get("reg_ratio")
+                        # CRITICAL: Prioritize eval_loss (test loss) for all tasks except GRPO
+                        entry_loss = entry.get("eval_loss")
+                        if entry_loss is None:
+                            entry_loss = entry.get("train_loss")  # Fallback only if eval_loss not available
+                        
+                        # Check if model size is similar (within 50% for reg_ratio learning)
+                        if entry_params > 0 and entry_reg_ratio is not None and entry_loss is not None:
+                            param_ratio = min(model_params, entry_params) / max(model_params, entry_params)
+                            if param_ratio >= 0.5:  # Within 50% model size
+                                # Prefer entries with better (lower) test loss
+                                if entry_loss < best_loss:
+                                    best_loss = entry_loss
+                                    best_reg_ratio = entry_reg_ratio
+                
+                # If we found historical reg_ratio, use it to infer optimal task adjustment
+                if best_reg_ratio is not None and best_reg_ratio > 0:
+                    # Calculate what the reg_ratio would be without task adjustment
+                    # Current reg_ratio already has time, batch, and model adjustments
+                    # We want to find what task_factor would give us the best_reg_ratio
+                    # best_reg_ratio = reg_ratio * optimal_task_factor
+                    # So: optimal_task_factor = best_reg_ratio / reg_ratio
+                    
+                    if reg_ratio > 0:
+                        inferred_task_factor = best_reg_ratio / reg_ratio
+                        # Bound the inferred factor to reasonable range (0.9 to 1.1)
+                        inferred_task_factor = max(0.9, min(1.1, inferred_task_factor))
+                        
+                        # Blend learned factor with reference factor (60% learned, 40% reference for stability)
+                        task_factor = 0.6 * inferred_task_factor + 0.4 * reference_task_factors.get(task_type, 1.0)
+                        print(f"  [reg_ratio]   - task_type AutoML: {task_factor:.4f}x (learned from reg_ratio={best_reg_ratio:.4f}, loss={best_loss:.6f})", flush=True)
+        except Exception as e:
+            # Fallback to reference values if AutoML lookup fails
+            print(f"  [reg_ratio]   - task_type AutoML lookup failed: {e}, using reference {task_factor:.4f}x", flush=True)
+        
+        if task_factor != 1.0:
+            reg_ratio *= task_factor
+            print(f"  [reg_ratio]   - task_type adjustment ({task_type}): {task_factor:.4f}x", flush=True)
     
     # Ensure reasonable bounds
     reg_ratio = max(0.5, min(2.0, reg_ratio))
@@ -486,21 +712,6 @@ def calculate_reg_ratio(
     hours_to_complete: float = None,
     method: str = "optimized"
 ) -> float:
-    """
-    Calculate reg_ratio (learning rate adjustment factor) using all available methods
-    and return an optimized value.
-    
-    Args:
-        task_type: Type of task (InstructTextTask, DpoTask, GrpoTask, ChatTask)
-        batch_size: Total batch size (per_device_batch_size * num_gpus * gradient_accumulation)
-        model_params: Number of model parameters
-        base_lr: Base learning rate before reg_ratio adjustment
-        method: Calculation method - "optimized" (calculate all and choose best, default),
-                "experimental" (default 1.24383), "sqrt_batch", "linear_batch", or "adaptive"
-    
-    Returns:
-        Calculated reg_ratio value
-    """
     print(f"  [reg_ratio] Calculating reg_ratio with method: '{method}'", flush=True)
     print(f"  [reg_ratio] Available parameters: task_type={task_type}, batch_size={batch_size}, "
           f"model_params={model_params}, base_lr={base_lr}, hours_to_complete={hours_to_complete}", flush=True)
@@ -862,9 +1073,11 @@ def main():
                     dataset_size = state.get("dataset_size", None)
                     first_run_loss = state.get("train", {}).get("current_loss", None)
                     
-                    # Calculate adaptive log_range
+                    # Calculate adaptive log_range (ALWAYS with full context for optimal value)
                     adaptive_log_range = get_log_scale(
                         args.task_type,
+                        model_name=original_model_name,
+                        request_path=request_path,
                         current_lr=current_lr,
                         model_params=model_params,
                         dataset_size=dataset_size,
@@ -873,7 +1086,9 @@ def main():
                         first_run_loss=first_run_loss
                     )
                     
-                    print(f"  [LR Search] Adaptive log_range: {adaptive_log_range:.4f} (base: {get_log_scale(args.task_type):.4f}, model_params={model_params/1e9 if model_params else None:.2f}B, dataset_size={dataset_size}, n_runs={n_runs}, hours={args.hours_to_complete:.2f})", flush=True)
+                    # Get base value for comparison (without context)
+                    base_log_range = get_log_scale(args.task_type)
+                    print(f"  [LR Search] Adaptive log_range: {adaptive_log_range:.4f} (base: {base_log_range:.4f}, model_params={model_params/1e9 if model_params else None:.2f}B, dataset_size={dataset_size}, n_runs={n_runs}, hours={args.hours_to_complete:.2f})", flush=True)
                     
                     state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=adaptive_log_range)
                     assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
@@ -887,20 +1102,79 @@ def main():
                     current_lr = state["lrs"][index]
                     train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
                 else: # the final run - continue training the best checkpoint to completion
-                    # CRITICAL: Use eval_loss for selection if available, otherwise fall back to current_loss
-                    # This is the key improvement - eval_loss is what matters for generalization
-                    if all("current_eval_loss" in run for run in state["runs"]):
-                        # Use eval_loss for selection (much better than train_loss)
+                    # IMPROVED: Use generalization_score if available, otherwise eval_loss, then train_loss
+                    # This prioritizes checkpoints with better generalization (lower overfitting)
+                    best_index = None
+                    best_score = float('inf')
+                    selection_method = None
+                    
+                    # Try to use generalization_score first (best metric)
+                    # Check if we have both eval_loss and train_loss for at least some runs
+                    has_train_loss = any("current_train_loss" in run for run in state["runs"])
+                    if all("current_eval_loss" in run for run in state["runs"]) and has_train_loss:
+                        # Calculate generalization_score for each run (same logic as in customized_trainer)
+                        for i, run in enumerate(state["runs"]):
+                            eval_loss = run.get("current_eval_loss", run["current_loss"])
+                            train_loss = run.get("current_train_loss", None)
+                            
+                            if train_loss is not None and train_loss > 0:
+                                overfitting_gap = max(0, eval_loss - train_loss)
+                                gap_ratio = eval_loss / train_loss if train_loss > 0 else float('inf')
+                                
+                                # Use same adaptive penalty as in customized_trainer
+                                if gap_ratio >= 2.0:
+                                    penalty_factor = 0.7
+                                elif gap_ratio >= 1.5:
+                                    penalty_factor = 0.5
+                                elif gap_ratio >= 1.2:
+                                    penalty_factor = 0.35
+                                else:
+                                    penalty_factor = 0.2
+                                
+                                gen_score = eval_loss - penalty_factor * overfitting_gap
+                            else:
+                                # Fallback: use eval_loss if train_loss not available
+                                gen_score = eval_loss
+                            
+                            if gen_score < best_score:
+                                best_score = gen_score
+                                best_index = i
+                                selection_method = "generalization_score"
+                    
+                    # Fallback to eval_loss if generalization_score not available
+                    if best_index is None and all("current_eval_loss" in run for run in state["runs"]):
                         losses_for_selection = [run.get("current_eval_loss", run["current_loss"]) for run in state["runs"]]
-                        index = np.argmin(losses_for_selection)
-                        selected_loss = state["runs"][index]["current_eval_loss"]
-                        print(f"BL (using eval_loss);{index};eval_loss={selected_loss:.6f};train_loss={state['runs'][index]['current_loss']:.6f};lr={state['lrs'][index]}", flush=True)
-                    else:
-                        # Fallback to current_loss if eval_loss not available (backward compatibility)
-                        losses_for_selection = [run["current_loss"] for run in state["runs"]]
-                        index = np.argmin(losses_for_selection)
-                        selected_loss = state["runs"][index]["current_loss"]
-                        print(f"BL (using train_loss fallback);{index};{selected_loss:.6f}; {state['lrs'][index]}", flush=True)
+                        best_index = np.argmin(losses_for_selection)
+                        best_score = state["runs"][best_index]["current_eval_loss"]
+                        selection_method = "eval_loss"
+                    
+                    # Final fallback to train_loss
+                    if best_index is None:
+                        if len(state["runs"]) > 0:
+                            losses_for_selection = [run["current_loss"] for run in state["runs"]]
+                            best_index = np.argmin(losses_for_selection)
+                            best_score = state["runs"][best_index]["current_loss"]
+                            selection_method = "train_loss_fallback"
+                        else:
+                            # Safety fallback: should never happen, but handle gracefully
+                            print(f"WARNING: No runs available for selection, using first run", flush=True)
+                            best_index = 0
+                            best_score = state["runs"][0]["current_loss"] if state["runs"] else float('inf')
+                            selection_method = "safety_fallback"
+                    
+                    # Safety check: ensure best_index is valid
+                    if best_index is None or best_index >= len(state["runs"]):
+                        print(f"ERROR: Invalid best_index {best_index}, using first run", flush=True)
+                        best_index = 0
+                        best_score = state["runs"][0]["current_loss"] if state["runs"] else float('inf')
+                        selection_method = "error_fallback"
+                    
+                    index = best_index
+                    selected_loss = best_score
+                    selected_run = state["runs"][index]
+                    eval_loss_val = selected_run.get("current_eval_loss", selected_run["current_loss"])
+                    train_loss_val = selected_run.get("current_train_loss", selected_run["current_loss"])
+                    print(f"BL (using {selection_method});{index};score={selected_loss:.6f};eval_loss={eval_loss_val:.6f};train_loss={train_loss_val:.6f};lr={state['lrs'][index]}", flush=True)
                     
                     c_train_info["train_request"]["checking_mode"] = "none"
                     # Use the best checkpoint's train_cmd and output_dir

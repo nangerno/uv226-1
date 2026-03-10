@@ -1,4 +1,7 @@
 from typing import Dict, Optional
+import os
+# Set CUDA memory allocation config before importing torch to reduce fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import requests
 import json
 import random
@@ -18,7 +21,6 @@ from transformers import (
     TrainingArguments,
 )
 
-import os
 import datetime
 import shutil
 from huggingface_hub import HfApi
@@ -228,19 +230,28 @@ def main():
     if "max_length" in train_request:
         max_length = train_request["max_length"]
 
-    # Reduce OOM retries by applying a conservative batch-size cap for long sequence lengths.
+    # OPTIMIZATION: More conservative batch-size cap for long sequence lengths to reduce OOM retries.
     # This is much faster than crashing multiple times and halving repeatedly.
+    # Made more conservative based on log analysis showing repeated OOM errors.
     if train_request.get("adjust_batch_size", True):
         cap = None
         if max_length >= 2048:
-            cap = 8 if not training_args.use_lora else 16
+            # Very long sequences: very conservative caps
+            cap = 6 if not training_args.use_lora else 12
         elif max_length >= 1536:
-            cap = 12 if not training_args.use_lora else 24
+            # Long sequences: conservative caps
+            cap = 10 if not training_args.use_lora else 20
         elif max_length >= 1024:
-            cap = 24 if not training_args.use_lora else 48
+            # Medium-long sequences: moderate caps
+            cap = 20 if not training_args.use_lora else 40
+        elif max_length >= 512:
+            # Medium sequences: slightly conservative caps
+            cap = 40 if not training_args.use_lora else 80
+        
         if cap is not None and training_args.per_device_train_batch_size > cap:
             log_info(
-                f"Capping per_device_train_batch_size from {training_args.per_device_train_batch_size} to {cap} (max_length={max_length}) to avoid OOM"
+                f"[Batch Size Cap] Capping per_device_train_batch_size from {training_args.per_device_train_batch_size} to {cap} "
+                f"(max_length={max_length}, use_lora={training_args.use_lora}) to avoid OOM"
             )
             training_args.per_device_train_batch_size = cap
 
