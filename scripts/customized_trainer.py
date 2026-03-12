@@ -35,7 +35,7 @@ ERROR_GENERATION_CONFIG_MODELS = [
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
 print(f"LOCAL_RANK: {LOCAL_RANK} in customized_trainer.py", flush=True)
-    
+
 class CustomEvalSaveCallback(TrainerCallback):
     def __init__(
         self,
@@ -76,6 +76,7 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.max_top_checkpoints = 3  # Track top 3 for better ensemble
         # FRESH: Smart checkpoint pruning - track predicted quality
         self.checkpoint_predictions = {}  # step -> predicted_loss
+        self.max_prediction_window = 300  # Keep predictions for next 300 steps max
         self.last_eval_loss = None
         self.eval_loss_trend = []  # Track trend for prediction
         # FRESH: Incremental evaluation - track subset evaluations
@@ -84,6 +85,175 @@ class CustomEvalSaveCallback(TrainerCallback):
         
     def compute_loss(self, state: TrainerState, metrics):
         return metrics.get("eval_loss", None)
+    
+    def cleanup_checkpoint_predictions(self, current_step: int):
+        if not self.checkpoint_predictions:
+            return
+        
+        # Remove predictions for steps that have already passed
+        steps_to_remove = [step for step in self.checkpoint_predictions.keys() if step < current_step]
+        for step in steps_to_remove:
+            del self.checkpoint_predictions[step]
+        
+        # Keep only predictions within the prediction window (next max_prediction_window steps)
+        max_future_step = current_step + self.max_prediction_window
+        steps_to_remove_future = [step for step in self.checkpoint_predictions.keys() if step > max_future_step]
+        for step in steps_to_remove_future:
+            del self.checkpoint_predictions[step]
+        
+        if steps_to_remove or steps_to_remove_future:
+            remaining_count = len(self.checkpoint_predictions)
+            print(f"  [Cleanup] Removed {len(steps_to_remove)} past and {len(steps_to_remove_future)} far-future predictions. Remaining: {remaining_count}", flush=True)
+    
+    def compute_generalization_score(self, eval_loss: float, state: TrainerState, metrics: Dict) -> tuple:
+        # Extract task-specific training metric
+        train_metric = None
+        eval_metric = eval_loss
+        
+        if state.log_history:
+            last_log = state.log_history[-1]
+            train_metric = last_log.get("loss", None)
+        
+        # Base generalization score starts with eval metric
+        generalization_score = eval_loss
+        overfitting_penalty = 0.0
+        
+        # Task-specific overfitting detection and penalty calculation
+        if self.task_type and "GrpoTask" in self.task_type:
+            # GRPO: Reward-based task - overfitting when train_reward >> eval_reward
+            # eval_loss is already negated reward (from compute_loss), so lower is better
+            # train_reward would be in log_history as "reward" or we need to extract it differently
+            train_reward = None
+            if state.log_history:
+                # Look for train reward in log_history
+                for log_entry in reversed(state.log_history):
+                    if "reward" in log_entry and "eval_reward" not in log_entry:
+                        train_reward = log_entry.get("reward", None)
+                        break
+                    # Also check if loss represents reward (for GRPO, sometimes loss is negated reward)
+                    if "loss" in log_entry and "eval_loss" not in log_entry:
+                        # For GRPO, training loss might be negated reward
+                        # We need to check if this is actually a reward metric
+                        potential_reward = log_entry.get("loss", None)
+                        if potential_reward is not None:
+                            # If loss is negative, it might be a reward (GRPO rewards are often positive)
+                            # But we can't be sure without task context, so we'll use a heuristic
+                            # Actually, for GRPO, we should look for explicit reward metrics
+                            pass
+            
+            if train_reward is not None:
+                train_metric = train_reward  # Store for return value
+                eval_reward = -eval_loss  # Convert back to reward space
+                eval_metric = eval_reward  # Update eval_metric for consistency
+                
+                # For GRPO: overfitting = train_reward >> eval_reward
+                # Reward gap: positive when train_reward > eval_reward (overfitting)
+                reward_gap = max(0, train_reward - eval_reward)
+                
+                # Calculate gap ratio (in reward space for interpretability)
+                # Higher ratio = more overfitting (train_reward >> eval_reward)
+                if eval_reward > 0:
+                    reward_gap_ratio = train_reward / eval_reward
+                elif train_reward > 0:
+                    # Eval reward is negative or zero, but train is positive = severe overfitting
+                    reward_gap_ratio = float('inf')
+                else:
+                    # Both negative or zero, use absolute difference normalized
+                    reward_gap_ratio = abs(train_reward - eval_reward) / max(abs(eval_reward), 0.01) if abs(eval_reward) > 0.01 else 1.0
+                
+                # Adaptive penalty for GRPO (similar structure but reward-aware)
+                # For rewards: penalty when train_reward >> eval_reward
+                if reward_gap_ratio >= 1.5:  # Train reward 50%+ higher than eval
+                    penalty_factor = 0.7  # Very strong penalty
+                elif reward_gap_ratio >= 1.3:
+                    penalty_factor = 0.5  # Strong penalty
+                elif reward_gap_ratio >= 1.15:
+                    penalty_factor = 0.35  # Moderate penalty
+                else:
+                    penalty_factor = 0.2  # Light penalty
+                
+                # Convert reward gap to loss space for penalty
+                # reward_gap is in reward space, convert to loss: loss_gap = -reward_gap
+                # But we want positive penalty, so scale reward_gap appropriately
+                # Since eval_loss = -eval_reward, we can use reward_gap directly
+                overfitting_penalty = penalty_factor * reward_gap
+                # Higher overfitting should make the score worse, not better.
+                generalization_score = eval_loss + overfitting_penalty
+                
+                print(f"  [GRPO] train_reward={train_reward:.6f}, eval_reward={eval_reward:.6f}, reward_gap={reward_gap:.6f}, reward_gap_ratio={reward_gap_ratio:.3f}, penalty_factor={penalty_factor:.2f}, overfitting_penalty={overfitting_penalty:.6f}", flush=True)
+            else:
+                # No train reward available, use eval_loss only
+                eval_reward = -eval_loss  # Convert back to reward space for consistency
+                eval_metric = eval_reward  # Update eval_metric
+                print(f"  [GRPO] No train_reward available, using eval_reward only", flush=True)
+                train_metric = None
+        
+        elif self.task_type and "DpoTask" in self.task_type:
+            # DPO: Loss-based task, but could also consider preference accuracy if available
+            train_loss = train_metric
+            preference_accuracy = None
+            
+            # Check for preference accuracy metric (if available)
+            if state.log_history:
+                for log_entry in reversed(state.log_history):
+                    if "eval_preference_accuracy" in log_entry or "preference_accuracy" in log_entry:
+                        preference_accuracy = log_entry.get("eval_preference_accuracy") or log_entry.get("preference_accuracy")
+                        break
+            
+            if train_loss is not None and train_loss > 0:
+                overfitting_gap = max(0, eval_loss - train_loss)
+                gap_ratio = eval_loss / train_loss if train_loss > 0 else float('inf')
+                
+                # Adaptive penalty factor (same as before for DPO)
+                if gap_ratio >= 2.0:
+                    penalty_factor = 0.7
+                elif gap_ratio >= 1.5:
+                    penalty_factor = 0.5
+                elif gap_ratio >= 1.2:
+                    penalty_factor = 0.35
+                else:
+                    penalty_factor = 0.2
+                
+                overfitting_penalty = penalty_factor * overfitting_gap
+                generalization_score = eval_loss + overfitting_penalty
+                
+                # Optional: Adjust based on preference accuracy if available
+                if preference_accuracy is not None:
+                    # Lower accuracy suggests worse generalization
+                    # Adjust penalty: if accuracy is low, increase penalty slightly
+                    if preference_accuracy < 0.6:  # Less than 60% accuracy
+                        accuracy_penalty_multiplier = 1.1
+                        overfitting_penalty *= accuracy_penalty_multiplier
+                        generalization_score = eval_loss + overfitting_penalty
+                        print(f"  [DPO] preference_accuracy={preference_accuracy:.3f} (low), adjusted penalty", flush=True)
+                
+                print(f"  [DPO] gap_ratio={gap_ratio:.3f}, overfitting_gap={overfitting_gap:.6f}, penalty_factor={penalty_factor:.2f}", flush=True)
+            else:
+                print(f"  [DPO] No train_loss available, using eval_loss only", flush=True)
+        
+        else:
+            # Default: Instruct/Chat tasks - loss-based
+            train_loss = train_metric
+            if train_loss is not None and train_loss > 0:
+                overfitting_gap = max(0, eval_loss - train_loss)
+                gap_ratio = eval_loss / train_loss if train_loss > 0 else float('inf')
+                
+                # Adaptive penalty factor
+                if gap_ratio >= 2.0:
+                    penalty_factor = 0.7
+                elif gap_ratio >= 1.5:
+                    penalty_factor = 0.5
+                elif gap_ratio >= 1.2:
+                    penalty_factor = 0.35
+                else:
+                    penalty_factor = 0.2
+                
+                overfitting_penalty = penalty_factor * overfitting_gap
+                generalization_score = eval_loss + overfitting_penalty
+            else:
+                print(f"  [Instruct/Chat] No train_loss available, using eval_loss only", flush=True)
+        
+        return generalization_score, overfitting_penalty, train_metric, eval_metric
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
         # Custom logic to decide whether to save or evaluate
@@ -184,6 +354,9 @@ class CustomEvalSaveCallback(TrainerCallback):
             
         when_to_eval = self.function_when_to_evaluate(state.global_step)
         if when_to_eval["eval"]:
+            # Clean up old predictions periodically (every evaluation check)
+            self.cleanup_checkpoint_predictions(state.global_step)
+            
             # FRESH: Smart checkpoint pruning - predict quality before evaluating
             # If predicted to be poor, skip evaluation to save time
             if state.global_step in self.checkpoint_predictions:
@@ -191,6 +364,8 @@ class CustomEvalSaveCallback(TrainerCallback):
                 best_loss = self.best_checkpoint_info["loss"] if self.best_checkpoint_info else float('inf')
                 if predicted_loss > best_loss * 1.15:  # 15% worse than best
                     print(f"FRESH: Skipping evaluation at step {state.global_step} - predicted loss {predicted_loss:.6f} is poor (best: {best_loss:.6f})", flush=True)
+                    # Remove the prediction after using it
+                    del self.checkpoint_predictions[state.global_step]
                     control.should_evaluate = False
                     control.should_save = False  # Don't save poor checkpoints
                     return control
@@ -212,6 +387,9 @@ class CustomEvalSaveCallback(TrainerCallback):
         self, args, state: TrainerState, control: TrainerControl, metrics, **kwargs
     ):
         self.save_only = False
+        # Clean up old predictions at the start of evaluation
+        self.cleanup_checkpoint_predictions(state.global_step)
+        
         # Use eval_loss (which is cross-entropy) for checkpoint selection
         # This directly optimizes for test_loss which is also cross-entropy
         eval_loss = self.compute_loss(state, metrics)
@@ -251,7 +429,15 @@ class CustomEvalSaveCallback(TrainerCallback):
                 if len(self.eval_loss_trend) >= 2:
                     avg_trend = sum(self.eval_loss_trend[-3:]) / min(3, len(self.eval_loss_trend))
                     predicted_next_loss = eval_loss + avg_trend
-                    self.checkpoint_predictions[state.global_step + 100] = predicted_next_loss
+                    predicted_step = state.global_step + 100
+                    
+                    # Only store prediction if it's within the prediction window
+                    if predicted_step <= state.global_step + self.max_prediction_window:
+                        self.checkpoint_predictions[predicted_step] = predicted_next_loss
+                        # Clean up after adding new prediction
+                        self.cleanup_checkpoint_predictions(state.global_step)
+                    else:
+                        print(f"  [Prediction] Skipping prediction for step {predicted_step} (beyond window of {self.max_prediction_window} steps)", flush=True)
                     
                     # If predicted loss is very poor, suggest early stopping
                     best_loss = self.best_checkpoint_info["loss"] if self.best_checkpoint_info else eval_loss
@@ -275,7 +461,22 @@ class CustomEvalSaveCallback(TrainerCallback):
                     # IMPROVED: Also store train_loss for generalization_score calculation
                     if train_loss_for_storage is not None:
                         my_state["train"]["current_train_loss"] = train_loss_for_storage
-                    print(f"CRITICAL: Stored eval_loss {eval_loss:.6f} and train_loss {train_loss_for_storage:.6f if train_loss_for_storage else None} at checking_step {state.global_step} for multi-run selection", flush=True)
+                    
+                    # Task-specific: Store reward metrics for GRPO
+                    if self.task_type and "GrpoTask" in self.task_type:
+                        my_state["train"]["current_eval_reward"] = -eval_loss  # Convert back to reward
+                        # Try to get train_reward
+                        train_reward_for_storage = None
+                        if state.log_history:
+                            for log_entry in reversed(state.log_history):
+                                if "reward" in log_entry and "eval_reward" not in log_entry:
+                                    train_reward_for_storage = log_entry.get("reward", None)
+                                    break
+                        if train_reward_for_storage is not None:
+                            my_state["train"]["current_train_reward"] = train_reward_for_storage
+                        print(f"CRITICAL: [GRPO] Stored eval_reward {-eval_loss:.6f} and train_reward {train_reward_for_storage:.6f if train_reward_for_storage else None} at checking_step {state.global_step} for multi-run selection", flush=True)
+                    else:
+                        print(f"CRITICAL: Stored eval_loss {eval_loss:.6f} and train_loss {train_loss_for_storage:.6f if train_loss_for_storage else None} at checking_step {state.global_step} for multi-run selection", flush=True)
                     
                     # Now make decision based on eval_loss instead of train_loss
                     current_is_the_best = False
@@ -327,62 +528,71 @@ class CustomEvalSaveCallback(TrainerCallback):
                     
                     return control
         
-        # IMPROVED: Monitor train/eval gap for overfitting detection and early stopping
+        # IMPROVED: Task-aware overfitting detection and early stopping
         overfitting_detected = False
         if state.log_history:
-            last_train_loss = state.log_history[-1].get("loss", None)
-            if last_train_loss and eval_loss:
-                gap_ratio = eval_loss / last_train_loss if last_train_loss > 0 else float('inf')
-                if gap_ratio > 2.0:  # Eval loss is 2x train loss = overfitting
-                    overfitting_detected = True
-                    print(f"WARNING: Overfitting detected! Train loss: {last_train_loss:.6f}, Eval loss: {eval_loss:.6f}, Ratio: {gap_ratio:.2f}", flush=True)
+            if self.task_type and "GrpoTask" in self.task_type:
+                # GRPO: Check reward gap (train_reward >> eval_reward = overfitting)
+                last_train_reward = None
+                for log_entry in reversed(state.log_history):
+                    if "reward" in log_entry and "eval_reward" not in log_entry:
+                        last_train_reward = log_entry.get("reward", None)
+                        break
+                
+                if last_train_reward is not None and eval_loss is not None:
+                    eval_reward = -eval_loss  # Convert back to reward space
+                    # Calculate reward gap ratio (handle edge cases)
+                    if eval_reward > 0:
+                        reward_gap_ratio = last_train_reward / eval_reward
+                    elif last_train_reward > 0:
+                        # Eval reward is negative/zero but train is positive = severe overfitting
+                        reward_gap_ratio = float('inf')
+                    else:
+                        # Both negative or zero, use absolute difference normalized
+                        reward_gap_ratio = abs(last_train_reward - eval_reward) / max(abs(eval_reward), 0.01) if abs(eval_reward) > 0.01 else 1.0
                     
-                    # IMPROVED: More aggressive early stopping when severe overfitting detected
-                    if gap_ratio > 2.5 and self.best_checkpoint_info is not None:
-                        best_eval = self.best_checkpoint_info.get("loss", float('inf'))
-                        if eval_loss > best_eval * 1.1:  # Current eval is 10% worse than best
-                            print(f"SEVERE OVERFITTING: Stopping early to prevent further degradation (gap_ratio={gap_ratio:.2f}, eval_loss={eval_loss:.6f} vs best={best_eval:.6f})", flush=True)
-                            control.should_training_stop = True
-                            return control
-        
-        # DECISIVE: Overfitting-aware checkpoint selection
-        # Track train_loss to compute generalization_score
-        train_loss = None
-        if state.log_history:
-            last_log = state.log_history[-1]
-            train_loss = last_log.get("loss", None)
-        
-        # Cross-entropy loss optimization: track best cross-entropy loss
-        # eval_loss is already cross-entropy, so we use it directly
-        if eval_loss is not None:
-            # IMPROVED: Compute generalization_score with adaptive overfitting penalty
-            # generalization_score = eval_loss - adaptive_penalty * overfitting_gap
-            # Lower score is better (we want low eval_loss and low overfitting)
-            generalization_score = eval_loss
-            overfitting_penalty = 0.0
-            if train_loss is not None and train_loss > 0:
-                overfitting_gap = max(0, eval_loss - train_loss)
-                gap_ratio = eval_loss / train_loss if train_loss > 0 else float('inf')
-                
-                # IMPROVED: Adaptive penalty factor based on gap severity
-                # Small gap (< 1.2x): light penalty (0.2)
-                # Medium gap (1.2-1.5x): moderate penalty (0.35)
-                # Large gap (1.5-2.0x): strong penalty (0.5)
-                # Very large gap (> 2.0x): very strong penalty (0.7)
-                if gap_ratio >= 2.0:
-                    penalty_factor = 0.7  # Very strong penalty for severe overfitting
-                elif gap_ratio >= 1.5:
-                    penalty_factor = 0.5  # Strong penalty
-                elif gap_ratio >= 1.2:
-                    penalty_factor = 0.35  # Moderate penalty
-                else:
-                    penalty_factor = 0.2  # Light penalty for small gaps
-                
-                overfitting_penalty = penalty_factor * overfitting_gap
-                generalization_score = eval_loss - overfitting_penalty
-                print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss={train_loss:.6f}, gap_ratio={gap_ratio:.3f}, overfitting_gap={overfitting_gap:.6f}, penalty_factor={penalty_factor:.2f}, generalization_score={generalization_score:.6f}", flush=True)
+                    # For GRPO: overfitting when train_reward is much higher than eval_reward
+                    if reward_gap_ratio > 1.5:  # Train reward 50%+ higher than eval
+                            overfitting_detected = True
+                            print(f"WARNING: [GRPO] Overfitting detected! Train reward: {last_train_reward:.6f}, Eval reward: {eval_reward:.6f}, Ratio: {reward_gap_ratio:.2f}", flush=True)
+                            
+                            if reward_gap_ratio > 2.0 and self.best_checkpoint_info is not None:
+                                best_eval = self.best_checkpoint_info.get("loss", float('inf'))
+                                if eval_loss > best_eval * 1.1:
+                                    print(f"SEVERE OVERFITTING [GRPO]: Stopping early (reward_gap_ratio={reward_gap_ratio:.2f}, eval_loss={eval_loss:.6f} vs best={best_eval:.6f})", flush=True)
+                                    control.should_training_stop = True
+                                    return control
             else:
-                print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss=None, generalization_score={generalization_score:.6f}", flush=True)
+                # Loss-based tasks (Instruct, DPO, Chat)
+                last_train_loss = state.log_history[-1].get("loss", None)
+                if last_train_loss and eval_loss:
+                    gap_ratio = eval_loss / last_train_loss if last_train_loss > 0 else float('inf')
+                    if gap_ratio > 2.0:  # Eval loss is 2x train loss = overfitting
+                        overfitting_detected = True
+                        task_label = "[DPO]" if self.task_type and "DpoTask" in self.task_type else "[Instruct/Chat]"
+                        print(f"WARNING: {task_label} Overfitting detected! Train loss: {last_train_loss:.6f}, Eval loss: {eval_loss:.6f}, Ratio: {gap_ratio:.2f}", flush=True)
+                        
+                        # IMPROVED: More aggressive early stopping when severe overfitting detected
+                        if gap_ratio > 2.5 and self.best_checkpoint_info is not None:
+                            best_eval = self.best_checkpoint_info.get("loss", float('inf'))
+                            if eval_loss > best_eval * 1.1:  # Current eval is 10% worse than best
+                                print(f"SEVERE OVERFITTING {task_label}: Stopping early to prevent further degradation (gap_ratio={gap_ratio:.2f}, eval_loss={eval_loss:.6f} vs best={best_eval:.6f})", flush=True)
+                                control.should_training_stop = True
+                                return control
+        
+        # DECISIVE: Overfitting-aware checkpoint selection (task-aware)
+        # Use task-specific generalization score calculation
+        if eval_loss is not None:
+            generalization_score, overfitting_penalty, train_metric, eval_metric = self.compute_generalization_score(
+                eval_loss, state, metrics
+            )
+            
+            # Log task-specific metrics
+            if self.task_type and "GrpoTask" in self.task_type:
+                print(f"Step {state.global_step}: eval_reward={-eval_loss:.6f}, train_reward={train_metric:.6f if train_metric else None}, generalization_score={generalization_score:.6f}", flush=True)
+            else:
+                train_loss = train_metric
+                print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss={train_loss:.6f if train_loss else None}, generalization_score={generalization_score:.6f}", flush=True)
             
             # Update best checkpoint using generalization_score (not just eval_loss)
             should_update = False
@@ -395,23 +605,40 @@ class CustomEvalSaveCallback(TrainerCallback):
                     should_update = True
             
             if should_update:
-                print(f"DECISIVE: Updating best checkpoint at step {state.global_step} with generalization_score: {generalization_score:.6f} (eval_loss: {eval_loss:.6f})", flush=True)
-                self.best_checkpoint_info = {
+                # Store task-specific metrics
+                checkpoint_metrics = {
                     "loss": eval_loss,
                     "step": state.global_step,
-                    "train_loss": train_loss,
                     "generalization_score": generalization_score,
                     "overfitting_penalty": overfitting_penalty
                 }
+                
+                # Add task-specific metrics
+                if self.task_type and "GrpoTask" in self.task_type:
+                    checkpoint_metrics["train_reward"] = train_metric if train_metric else None
+                    checkpoint_metrics["eval_reward"] = -eval_loss
+                else:
+                    checkpoint_metrics["train_loss"] = train_metric
+                    checkpoint_metrics["eval_loss"] = eval_loss
+                
+                print(f"DECISIVE: Updating best checkpoint at step {state.global_step} with generalization_score: {generalization_score:.6f} (eval_loss: {eval_loss:.6f})", flush=True)
+                self.best_checkpoint_info = checkpoint_metrics
                 self.update_best_checkpoint = True
             
             # DECISIVE: Track top 3 checkpoints for interpolation
             checkpoint_entry = {
                 "step": state.global_step,
                 "eval_loss": eval_loss,
-                "train_loss": train_loss,
                 "generalization_score": generalization_score
             }
+            
+            # Add task-specific metrics to checkpoint entry
+            if self.task_type and "GrpoTask" in self.task_type:
+                checkpoint_entry["train_reward"] = train_metric
+                checkpoint_entry["eval_reward"] = -eval_loss
+            else:
+                checkpoint_entry["train_loss"] = train_metric
+                checkpoint_entry["eval_loss"] = eval_loss
             
             # Add to top checkpoints list
             self.top_checkpoints.append(checkpoint_entry)
@@ -431,7 +658,7 @@ class CustomEvalSaveCallback(TrainerCallback):
 
     def on_save(self, args, state: TrainerState, control: TrainerControl, **kwargs):
         
-        if state.global_step == self.max_steps and self.max_steps != -1:
+        if self.max_steps != -1 and state.global_step >= self.max_steps:
             print(f"Stop training because of max steps: {self.max_steps}", flush=True)
             control.should_training_stop = True
         
@@ -510,11 +737,25 @@ class CustomEvalSaveCallback(TrainerCallback):
             best_eval_loss = self.best_checkpoint_info["loss"]
             best_gen_score = self.best_checkpoint_info.get("generalization_score", best_eval_loss)
             
-            # DECISIVE: Checkpoint interpolation - use top 2-3 checkpoints if available
-            # Improved: Use top 3 checkpoints with weighted blending for better generalization
+            # Interpolation is expensive CPU/file I/O work, so only do it when the job
+            # has enough wall-clock budget for the extra overhead.
+            interpolation_hours_budget = self.metadata.get("hours_to_complete")
+            # Enable interpolation for any job with at least 45 minutes of budget.
+            # Model soups (checkpoint averaging) lower test loss by ~1-3 % vs. any single
+            # checkpoint, and the extra I/O happens after training ends — zero training overhead.
+            allow_interpolation = (
+                interpolation_hours_budget is None or interpolation_hours_budget >= 0.75
+            )
             use_interpolation = (
-                len(self.top_checkpoints) >= 2 
-                and self.top_checkpoints[0]["generalization_score"] < self.top_checkpoints[1]["generalization_score"] * 1.08  # Within 8% of each other
+                allow_interpolation
+                and self.task_type != "GrpoTask"
+                and len(self.top_checkpoints) >= 2
+                # Similarity gate (correct direction — top_checkpoints sorted ascending so
+                # index 0 = best/lowest score, index 1 = second best/higher score):
+                # Only average if the second checkpoint is at most 25 % worse than the best.
+                # i.e. second_score < best_score * 1.25
+                # (The previous expression had operands reversed, making it always True.)
+                and self.top_checkpoints[1]["generalization_score"] < self.top_checkpoints[0]["generalization_score"] * 1.25
             )
             
             if use_interpolation:
@@ -666,6 +907,8 @@ class CustomEvalSaveCallback(TrainerCallback):
                     interpolation_info = "single_best"
             else:
                 # Use single best checkpoint (with generalization_score)
+                if not allow_interpolation:
+                    print("Skipping checkpoint interpolation to preserve limited training time", flush=True)
                 print(f"Using best checkpoint (generalization_score={best_gen_score:.6f}, eval_loss={best_eval_loss:.6f})", flush=True)
                 shutil.copytree(
                     os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
@@ -831,6 +1074,72 @@ class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
             
         return eval_loss
     
+    def compute_generalization_score(self, eval_loss: float, state: TrainerState, metrics: Dict) -> tuple:
+        """
+        GRPO-specific generalization score using reward-based metrics.
+        For GRPO: overfitting = train_reward >> eval_reward
+        """
+        # Extract train reward from log_history
+        train_reward = None
+        if state.log_history:
+            # Look for train reward in log_history
+            for log_entry in reversed(state.log_history):
+                if "reward" in log_entry and "eval_reward" not in log_entry:
+                    train_reward = log_entry.get("reward", None)
+                    break
+                # Also check metrics directly
+                if "train_reward" in log_entry:
+                    train_reward = log_entry.get("train_reward", None)
+                    break
+        
+        # If not found in log_history, try metrics dict
+        if train_reward is None:
+            train_reward = metrics.get("train_reward", None)
+        
+        eval_reward = -eval_loss  # Convert back to reward space (eval_loss is negated reward)
+        generalization_score = eval_loss  # Start with eval_loss (lower is better)
+        overfitting_penalty = 0.0
+        
+        if train_reward is not None:
+            # For GRPO: overfitting when train_reward >> eval_reward
+            # In reward space: higher is better, so gap = train_reward - eval_reward
+            # In loss space: we want to penalize when train_reward >> eval_reward
+            reward_gap = max(0, train_reward - eval_reward)
+            
+            # Calculate gap ratio (in reward space for interpretability)
+            if eval_reward > 0:
+                reward_gap_ratio = train_reward / eval_reward
+            elif train_reward > 0:
+                # Eval reward is negative or zero, but train is positive = severe overfitting
+                reward_gap_ratio = float('inf')
+            else:
+                # Both negative or zero, use absolute difference
+                reward_gap_ratio = abs(train_reward - eval_reward) / max(abs(eval_reward), 0.01) if abs(eval_reward) > 0.01 else 1.0
+            
+            # Adaptive penalty for GRPO reward gap
+            # Penalize more when train_reward is much higher than eval_reward
+            if reward_gap_ratio >= 1.5:  # Train reward 50%+ higher
+                penalty_factor = 0.7  # Very strong penalty
+            elif reward_gap_ratio >= 1.3:  # Train reward 30%+ higher
+                penalty_factor = 0.5  # Strong penalty
+            elif reward_gap_ratio >= 1.15:  # Train reward 15%+ higher
+                penalty_factor = 0.35  # Moderate penalty
+            else:
+                penalty_factor = 0.2  # Light penalty
+            
+            # Convert reward gap to loss space for penalty calculation
+            # reward_gap in reward space, convert to loss space: loss_gap = -reward_gap
+            # But we want positive penalty, so use reward_gap directly scaled
+            overfitting_penalty = penalty_factor * reward_gap
+            generalization_score = eval_loss + overfitting_penalty
+            
+            print(f"  [GRPO] train_reward={train_reward:.6f}, eval_reward={eval_reward:.6f}, reward_gap={reward_gap:.6f}, reward_gap_ratio={reward_gap_ratio:.3f}, penalty_factor={penalty_factor:.2f}, overfitting_penalty={overfitting_penalty:.6f}", flush=True)
+        else:
+            # No train reward available, use eval_loss only
+            print(f"  [GRPO] No train_reward available, using eval_reward only", flush=True)
+        
+        return generalization_score, overfitting_penalty, train_reward, eval_reward
+    
     def penalize_eval_loss(self, eval_loss: float):
         if eval_loss < 0:
             return eval_loss / 3
@@ -920,7 +1229,7 @@ class WhenToEvalHandler:
                 self.run_eval = True
                 return {"eval": True, "reason": "end_time"}
         
-        if self.max_steps != -1 and global_step == self.max_steps:
+        if self.max_steps != -1 and global_step >= self.max_steps:
             print(f"Stop training because of max steps: {self.max_steps}", flush=True)
             return {"eval": True, "reason": "max_step"}
 
@@ -960,18 +1269,19 @@ def init_wandb(train_request: Dict):
 
 
 class EarlyStoppingCallback(TrainerCallback):
-    def __init__(self, patience: int = 300, min_delta: float = 0.0001, hours_to_complete: float = None):
-        # Adaptive patience: reduce for short jobs to stop faster and save time
+    def __init__(self, patience: int = 8, min_delta: float = 0.0001, hours_to_complete: float = None):
+        # Adaptive patience in evaluation-counts (one count = one on_evaluate call).
+        # Evaluation fires every ~40-150 steps, so patience=8 ≈ 320-1200 steps without improvement.
         if hours_to_complete is not None and hours_to_complete > 0:
-            if hours_to_complete <= 0.75:  # Very short jobs
-                self.patience = 50  # Very aggressive early stopping
+            if hours_to_complete <= 0.75:  # Very short jobs (<45 min)
+                self.patience = 4
             elif hours_to_complete <= 1.5:  # Short jobs
-                self.patience = 100
+                self.patience = 6
             elif hours_to_complete <= 2.0:  # Medium jobs
-                self.patience = 200
-            else:  # Long jobs
-                self.patience = patience  # Use provided patience
-            print(f"Adaptive early stopping: patience={self.patience} for {hours_to_complete:.2f}h job", flush=True)
+                self.patience = 8
+            else:  # Long jobs — use the provided patience value
+                self.patience = patience
+            print(f"Adaptive early stopping: patience={self.patience} evaluations for {hours_to_complete:.2f}h job", flush=True)
         else:
             self.patience = patience
         self.min_delta = min_delta
@@ -997,9 +1307,10 @@ class EarlyStoppingCallback(TrainerCallback):
             self.wait = 0
         elif eval_loss < self.best_loss - self.min_delta:
             # Significant improvement
+            prev_best = self.best_loss
             self.best_loss = eval_loss
             self.wait = 0
-            print(f"Early stopping: Improved eval_loss to {eval_loss:.6f} (best: {self.best_loss:.6f}), resetting patience counter", flush=True)
+            print(f"Early stopping: Improved eval_loss to {eval_loss:.6f} (prev best: {prev_best:.6f}), resetting patience counter", flush=True)
         else:
             # No improvement
             self.wait += 1

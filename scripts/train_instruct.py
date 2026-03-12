@@ -209,6 +209,10 @@ def main():
     (training_args, lora_args) = argument_parser.parse_args_into_dataclasses()
     train_info = json.load(open(training_args.request_path, "r"))
     train_request = train_info["train_request"]
+    min_steps_per_epoch = train_request.get(
+        "min_steps_per_epoch", train_request["min_steps"]
+    )
+    train_request["min_steps_per_epoch"] = min_steps_per_epoch
     # log_info(f"Training request: {train_request}", "start")
     task_id = train_request["task_id"]
 
@@ -277,13 +281,15 @@ def main():
         * training_args.gradient_accumulation_steps
         * training_args.world_size
     )  # number of steps in the original training
-    # min_steps here is per epoch
-    if original_steps < train_request["min_steps"]:
+    # This heuristic is per epoch and is used to decide packing/batch-size behavior.
+    if original_steps < min_steps_per_epoch:
         donot_pack = True
-        log_info(f"original_steps: {original_steps} < min_steps: {train_request['min_steps']}, do not pack the dataset")
+        log_info(
+            f"original_steps: {original_steps} < min_steps_per_epoch: {min_steps_per_epoch}, do not pack the dataset"
+        )
 
     min_data_size_num = (
-        train_request["min_steps"]
+        min_steps_per_epoch
         * training_args.per_device_train_batch_size
         * training_args.gradient_accumulation_steps
         * training_args.world_size
@@ -331,7 +337,7 @@ def main():
     max_batch_size_theory = len(train_ds) / (
         training_args.gradient_accumulation_steps
         * training_args.world_size
-        * train_request["min_steps"]
+        * min_steps_per_epoch
     )
     max_batch_size_theory = int(max_batch_size_theory)
     if max_batch_size_theory == 0:
@@ -378,7 +384,9 @@ def main():
     training_args.save_only_model = True  # only save the model, not the optimizer
     
     max_steps = train_request.get("max_steps", -1)
-    log_info(f"max_steps: {max_steps}")
+    training_args.max_steps = max_steps if max_steps and max_steps > 0 else -1
+    log_info(f"min_steps_per_epoch: {min_steps_per_epoch}")
+    log_info(f"effective max_steps: {training_args.max_steps}")
     
     start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     state = get_state()
@@ -430,9 +438,8 @@ def main():
         "reg_ratio": train_info.get("reg_ratio"),  # Get from train_info if available
     }
     
-    # Determine task type (InstructTextTask or ChatTask)
-    task_type = "InstructTextTask"  # Default
-    # Could check train_request for task_type if available, or infer from dataset_type
+    # Determine task type from train_request (populated by text_trainer.py via task_type field)
+    task_type = train_request.get("task_type", "InstructTextTask")
     
     trainer = Trainer(
         model=model,
@@ -455,7 +462,7 @@ def main():
                 update_lr_lookup=train_request.get("find_lk_lr", True),  # Use find_lk_lr flag to control updates
                 metadata=metadata
             ),
-            EarlyStoppingCallback(patience=300, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
+            EarlyStoppingCallback(patience=8, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
         ],
     )
 

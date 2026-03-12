@@ -315,6 +315,10 @@ def main():
 
     train_info = json.load(open(training_args.request_path, "r"))
     train_request = train_info["train_request"]
+    min_steps_per_epoch = train_request.get(
+        "min_steps_per_epoch", train_request["min_steps"]
+    )
+    train_request["min_steps_per_epoch"] = min_steps_per_epoch
     task_id = train_request["task_id"]
     
     # wandb_init_success = init_wandb(train_request)
@@ -363,7 +367,7 @@ def main():
     max_batch_size_theory = len(train_ds) / (
         training_args.gradient_accumulation_steps
         * training_args.world_size
-        * train_request["min_steps"]
+        * min_steps_per_epoch
     )
     max_batch_size_theory = int(max_batch_size_theory)
     if max_batch_size_theory == 0:
@@ -448,7 +452,9 @@ def main():
     log_info(f"Truncate the train_ds and dev_ds time: {(t2 - t1).seconds} seconds")
 
     max_steps = train_request.get("max_steps", -1)
-    log_info(f"max_steps: {max_steps}")
+    training_args.max_steps = max_steps if max_steps and max_steps > 0 else -1
+    log_info(f"min_steps_per_epoch: {min_steps_per_epoch}")
+    log_info(f"effective max_steps: {training_args.max_steps}")
     
     total_steps_all_epochs = total_steps_per_epoch * training_args.num_train_epochs
     log_info(f"total_steps_per_epoch: {total_steps_per_epoch}; total_steps_all_epochs: {total_steps_all_epochs}")
@@ -498,7 +504,7 @@ def main():
         processing_class=tokenizer,
         peft_config=peft_config,
         callbacks=[
-            CustomEvalSaveCallback(
+            GRPOCustomEvalSaveCallback(
                 WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
                 train_request["submission_dir"],
                 training_args.output_dir,
@@ -512,7 +518,7 @@ def main():
                 update_lr_lookup=train_request.get("find_lk_lr", False),  # GRPO typically doesn't use lookup
                 metadata=metadata
             ),
-            EarlyStoppingCallback(patience=300, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
+            EarlyStoppingCallback(patience=8, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
         ],
     )
 

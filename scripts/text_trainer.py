@@ -80,17 +80,21 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
 
 
 def replace_args_in_cmd(cmd: str, arg_name: str, arg_value: str):
-    match = re.search(rf"(?P<p>--{arg_name}(\s+)([^\s]+))(\s+)", cmd)
+    match = re.search(rf"(?P<p>--{arg_name}(\s+)([^\s]+))(?P<suffix>\s+|$)", cmd)
     if match:
         left_index = match.start("p")
         right_index = match.end("p")
-        return cmd[:left_index] + f" --{arg_name} {arg_value} " + cmd[right_index:]
+        suffix = match.group("suffix")
+        replacement_suffix = suffix if suffix else ""
+        return cmd[:left_index] + f" --{arg_name} {arg_value}" + replacement_suffix + cmd[match.end("suffix"):]
     else:
         return None
 
 
 def extract_value_from_cmd(cmd: str, arg_name: str):
-    match = re.search(rf"(?P<p>--{arg_name}(\s+)(?P<value>[^\s]+))(\s+)", cmd)
+    match = re.search(
+        rf"(?P<p>--{arg_name}(\s+)(?P<value>[^\s]+))(?P<suffix>\s+|$)", cmd
+    )
     if match:
         return match.group("value")
     else:
@@ -159,10 +163,37 @@ def get_error_type(log_path: str):
         return None
 
 
+def replace_arg_if_present(cmd: str, arg_name: str, arg_value: str):
+    updated_cmd = replace_args_in_cmd(cmd, arg_name, arg_value)
+    if updated_cmd is None:
+        print(
+            f"  [Retry Logic] Could not find '--{arg_name}' in train command; keeping existing value",
+            flush=True,
+        )
+        return cmd
+    return updated_cmd
+
+
+def validate_training_args(args, parser: argparse.ArgumentParser):
+    if args.retries < 1:
+        parser.error("--retries must be >= 1")
+
+    if args.min_steps < 1:
+        parser.error(
+            "--min-steps must be >= 1 because it is used as a per-epoch packing/batch-size heuristic"
+        )
+
+    if args.max_steps == 0 or args.max_steps < -1:
+        parser.error("--max-steps must be -1 or >= 1")
+
+    if args.max_data_size == 0 or args.max_data_size < -1:
+        parser.error("--max-data-size must be -1 or >= 1")
+
+
 def extract_output_dir(train_cmd: str) -> str:
-    match = re.search(r"--output_dir\s+(.*?)\s+", train_cmd)
+    match = re.search(r"--output_dir\s+(?P<value>[^\s]+)(?:\s+|$)", train_cmd)
     if match:
-        return match.group(1)
+        return match.group("value")
     else:
         return None
 
@@ -175,6 +206,7 @@ def run_training(
     task_type: str,
     expected_repo_name: str,
 ):
+    retries = max(1, retries)
     # OPTIMIZATION: More aggressive memory management before training
     try:
         import torch
@@ -223,8 +255,15 @@ def run_training(
                     current_batch_size = extract_value_from_cmd(
                         train_cmd, "per_device_train_batch_size"
                     )
-                    current_batch_size = int(current_batch_size)
-                    if current_batch_size > 1:
+                    current_batch_size = (
+                        int(current_batch_size) if current_batch_size is not None else None
+                    )
+                    if current_batch_size is None:
+                        print(
+                            "  [OOM Recovery] Could not determine current batch size; retrying with the same command",
+                            flush=True,
+                        )
+                    elif current_batch_size > 1:
                         # OPTIMIZATION: Smarter batch size reduction based on retry count
                         # First retry: reduce by 50%, subsequent retries: reduce by 40% (more conservative)
                         if i == 1:
@@ -243,24 +282,45 @@ def run_training(
                             f"(retry {i+1}/{retries}, reduction: {int((1-reduction_factor)*100)}%)",
                             flush=True,
                         )
-                        train_cmd = replace_args_in_cmd(
+                        train_cmd = replace_arg_if_present(
                             train_cmd,
                             "per_device_train_batch_size",
                             str(new_batch_size),
                         )
-                        # print(f"New train command: {train_cmd}", flush=True)
                     else:
                         print(f"  [OOM Recovery] Batch size is 1, cannot reduce further", flush=True)
                         if task_type == TaskType.GRPOTASK.value:
+                            current_use_vllm = extract_value_from_cmd(train_cmd, "use_vllm")
                             # disable vllm
-                            train_cmd = replace_args_in_cmd(
-                                train_cmd, "use_vllm", "False"
+                            if current_use_vllm != "False":
+                                train_cmd = replace_arg_if_present(
+                                    train_cmd, "use_vllm", "False"
+                                )
+                                print(f"  [OOM Recovery] Disabled VLLM as last resort", flush=True)
+                            else:
+                                print(
+                                    "  [OOM Recovery] Batch size is already 1 and VLLM is already disabled; stopping retries",
+                                    flush=True,
+                                )
+                                break
+                        else:
+                            print(
+                                "  [OOM Recovery] Batch size is already 1; stopping retries because the next launch would be identical",
+                                flush=True,
                             )
-                            print(f"  [OOM Recovery] Disabled VLLM as last resort", flush=True)
+                            break
                 elif error_type == VLLM_OOM_ERROR:
                     if task_type == TaskType.GRPOTASK.value:
-                        print(f"  [OOM Recovery] VLLM OOM error, disabling VLLM", flush=True)
-                        train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
+                        current_use_vllm = extract_value_from_cmd(train_cmd, "use_vllm")
+                        if current_use_vllm != "False":
+                            print(f"  [OOM Recovery] VLLM OOM error, disabling VLLM", flush=True)
+                            train_cmd = replace_arg_if_present(train_cmd, "use_vllm", "False")
+                        else:
+                            print(
+                                "  [OOM Recovery] VLLM is already disabled; stopping retries because the next launch would be identical",
+                                flush=True,
+                            )
+                            break
 
         # empty the log file if it exists
         if os.path.exists(log_path):
@@ -861,14 +921,19 @@ def main():
     parser.add_argument(
         "--max-steps", 
         type=int, 
-        help="Max steps to use for training", 
+        help="Hard cap on total optimizer steps (-1 disables the cap)", 
         default=-1
     )
-    parser.add_argument("--retries", type=int, help="Number of retries", default=5)
+    parser.add_argument(
+        "--retries",
+        type=int,
+        help="Max training launch attempts for recoverable failures",
+        default=5,
+    )
     parser.add_argument(
         "--min-steps", 
         type=int, 
-        help="Min steps to use for training", 
+        help="Target minimum steps per epoch used for packing and batch-size heuristics", 
         default=100
     )
 
@@ -887,6 +952,7 @@ def main():
     )
 
     args = parser.parse_args()
+    validate_training_args(args, parser)
     original_model_name = args.model
     original_task_type = args.task_type
     
@@ -993,10 +1059,12 @@ def main():
         "max_steps": args.max_steps,
         "wandb_log_dir": train_cst.WANDB_LOGS_DIR,
         "min_steps": args.min_steps,
+        "min_steps_per_epoch": args.min_steps,
         "is_openai": is_openai,
         "reg_ratio": args.reg_ratio,
         "find_lk_lr": True,
         "checking_mode": "first_time",
+        "task_type": args.task_type,
     }
 
     if (args.task_type == TaskType.INSTRUCTTEXTTASK.value or args.task_type == TaskType.CHATTASK.value):
@@ -1054,137 +1122,130 @@ def main():
         train_cmd = original_train_cmd  # will replace based on the state later
         c_train_info = copy.deepcopy(train_info)
         final_output_dir = None
-        if args.task_type == TaskType.GRPOTASK.value:
-            state["mode"] = "finish" # do not run this for GRPO task
-            c_train_info["train_request"]["checking_mode"] = "none"
-        else:
-            if state["mode"] == "initial":
-                c_train_info["train_request"]["checking_mode"] = "none" if disable_multirun else "first_time"
-                
-            elif state["mode"] == "continue":
-                c_train_info["train_request"]["checking_mode"] = "second_time"
-                n_runs = state["next_runs"]
-                if "lrs" not in state: # first time of continue
-                    current_lr = float(state["train"]["lr"])
-                    
-                    # Get adaptive parameters for log_range calculation
-                    # Try to get from state first (stored during initial setup)
-                    model_params = state.get("model_params", model_params)  # Fallback to global
-                    dataset_size = state.get("dataset_size", None)
-                    first_run_loss = state.get("train", {}).get("current_loss", None)
-                    
-                    # Calculate adaptive log_range (ALWAYS with full context for optimal value)
-                    adaptive_log_range = get_log_scale(
-                        args.task_type,
-                        model_name=original_model_name,
-                        request_path=request_path,
-                        current_lr=current_lr,
-                        model_params=model_params,
-                        dataset_size=dataset_size,
-                        hours_to_complete=args.hours_to_complete,
-                        n_runs=n_runs,
-                        first_run_loss=first_run_loss
-                    )
-                    
-                    # Get base value for comparison (without context)
-                    base_log_range = get_log_scale(args.task_type)
-                    print(f"  [LR Search] Adaptive log_range: {adaptive_log_range:.4f} (base: {base_log_range:.4f}, model_params={model_params/1e9 if model_params else None:.2f}B, dataset_size={dataset_size}, n_runs={n_runs}, hours={args.hours_to_complete:.2f})", flush=True)
-                    
-                    state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=adaptive_log_range)
-                    assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
-                    state["runs"] = []
-                
-                set_state(state)
-                state["runs"].append(state["train"].copy())
-                delete_poor_checkpoints(state["runs"])
-                if len(state["runs"]) < n_runs:
-                    index = len(state["runs"])
-                    current_lr = state["lrs"][index]
-                    train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
-                else: # the final run - continue training the best checkpoint to completion
-                    # IMPROVED: Use generalization_score if available, otherwise eval_loss, then train_loss
-                    # This prioritizes checkpoints with better generalization (lower overfitting)
-                    best_index = None
-                    best_score = float('inf')
-                    selection_method = None
-                    
-                    # Try to use generalization_score first (best metric)
-                    # Check if we have both eval_loss and train_loss for at least some runs
-                    has_train_loss = any("current_train_loss" in run for run in state["runs"])
-                    if all("current_eval_loss" in run for run in state["runs"]) and has_train_loss:
-                        # Calculate generalization_score for each run (same logic as in customized_trainer)
-                        for i, run in enumerate(state["runs"]):
-                            eval_loss = run.get("current_eval_loss", run["current_loss"])
-                            train_loss = run.get("current_train_loss", None)
-                            
-                            if train_loss is not None and train_loss > 0:
-                                overfitting_gap = max(0, eval_loss - train_loss)
-                                gap_ratio = eval_loss / train_loss if train_loss > 0 else float('inf')
-                                
-                                # Use same adaptive penalty as in customized_trainer
-                                if gap_ratio >= 2.0:
-                                    penalty_factor = 0.7
-                                elif gap_ratio >= 1.5:
-                                    penalty_factor = 0.5
-                                elif gap_ratio >= 1.2:
-                                    penalty_factor = 0.35
-                                else:
-                                    penalty_factor = 0.2
-                                
-                                gen_score = eval_loss - penalty_factor * overfitting_gap
+        if state["mode"] == "initial":
+            c_train_info["train_request"]["checking_mode"] = "none" if disable_multirun else "first_time"
+
+        elif state["mode"] == "continue":
+            c_train_info["train_request"]["checking_mode"] = "second_time"
+            n_runs = state["next_runs"]
+            if "lrs" not in state:  # first time entering continue
+                current_lr = float(state["train"]["lr"])
+
+                # Get adaptive parameters for log_range calculation
+                model_params = state.get("model_params", model_params)  # fallback to global
+                dataset_size = state.get("dataset_size", None)
+                first_run_loss = state.get("train", {}).get("current_loss", None)
+
+                # Calculate adaptive log_range with full context for optimal LR spread
+                adaptive_log_range = get_log_scale(
+                    args.task_type,
+                    model_name=original_model_name,
+                    request_path=request_path,
+                    current_lr=current_lr,
+                    model_params=model_params,
+                    dataset_size=dataset_size,
+                    hours_to_complete=args.hours_to_complete,
+                    n_runs=n_runs,
+                    first_run_loss=first_run_loss
+                )
+
+                base_log_range = get_log_scale(args.task_type)
+                print(f"  [LR Search] Adaptive log_range: {adaptive_log_range:.4f} (base: {base_log_range:.4f}, model_params={model_params/1e9 if model_params else None:.2f}B, dataset_size={dataset_size}, n_runs={n_runs}, hours={args.hours_to_complete:.2f})", flush=True)
+
+                state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=adaptive_log_range)
+                assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
+                state["runs"] = []
+
+            set_state(state)
+            state["runs"].append(state["train"].copy())
+            if len(state["runs"]) < n_runs:
+                index = len(state["runs"])
+                current_lr = state["lrs"][index]
+                train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
+            else:  # all LR-race runs done — select the best and continue to completion
+                best_index = None
+                best_score = float('inf')
+                selection_method = None
+
+                # CRITICAL FIX: Only rank runs that actually captured eval_loss at checking_step.
+                # The first_time run (runs[0]) stops early without running evaluation, so it has
+                # no current_eval_loss — comparing it against second_time runs would always lose,
+                # causing the selection to fall through to the useless train_loss_fallback branch.
+                runs_with_eval = [(i, run) for i, run in enumerate(state["runs"]) if "current_eval_loss" in run]
+
+                # Tier 1: generalization_score (eval_loss + adaptive overfitting penalty)
+                has_train_loss = any("current_train_loss" in run for _, run in runs_with_eval)
+                if runs_with_eval and has_train_loss:
+                    for i, run in runs_with_eval:
+                        eval_loss = run["current_eval_loss"]
+                        train_loss = run.get("current_train_loss", None)
+                        if train_loss is not None and train_loss > 0:
+                            overfitting_gap = max(0, eval_loss - train_loss)
+                            gap_ratio = eval_loss / train_loss
+                            if gap_ratio >= 2.0:
+                                penalty_factor = 0.7
+                            elif gap_ratio >= 1.5:
+                                penalty_factor = 0.5
+                            elif gap_ratio >= 1.2:
+                                penalty_factor = 0.35
                             else:
-                                # Fallback: use eval_loss if train_loss not available
-                                gen_score = eval_loss
-                            
-                            if gen_score < best_score:
-                                best_score = gen_score
-                                best_index = i
-                                selection_method = "generalization_score"
-                    
-                    # Fallback to eval_loss if generalization_score not available
-                    if best_index is None and all("current_eval_loss" in run for run in state["runs"]):
-                        losses_for_selection = [run.get("current_eval_loss", run["current_loss"]) for run in state["runs"]]
-                        best_index = np.argmin(losses_for_selection)
-                        best_score = state["runs"][best_index]["current_eval_loss"]
-                        selection_method = "eval_loss"
-                    
-                    # Final fallback to train_loss
-                    if best_index is None:
-                        if len(state["runs"]) > 0:
-                            losses_for_selection = [run["current_loss"] for run in state["runs"]]
-                            best_index = np.argmin(losses_for_selection)
-                            best_score = state["runs"][best_index]["current_loss"]
-                            selection_method = "train_loss_fallback"
+                                penalty_factor = 0.2
+                            gen_score = eval_loss + penalty_factor * overfitting_gap
                         else:
-                            # Safety fallback: should never happen, but handle gracefully
-                            print(f"WARNING: No runs available for selection, using first run", flush=True)
-                            best_index = 0
-                            best_score = state["runs"][0]["current_loss"] if state["runs"] else float('inf')
-                            selection_method = "safety_fallback"
-                    
-                    # Safety check: ensure best_index is valid
-                    if best_index is None or best_index >= len(state["runs"]):
-                        print(f"ERROR: Invalid best_index {best_index}, using first run", flush=True)
+                            gen_score = eval_loss
+                        if gen_score < best_score:
+                            best_score = gen_score
+                            best_index = i
+                            selection_method = "generalization_score"
+
+                # Tier 2: plain eval_loss (no train_loss available)
+                if best_index is None and runs_with_eval:
+                    for i, run in runs_with_eval:
+                        el = run["current_eval_loss"]
+                        if el < best_score:
+                            best_score = el
+                            best_index = i
+                    if best_index is not None:
+                        selection_method = "eval_loss"
+
+                # Tier 3: train_loss fallback (all runs — first_time + second_time)
+                if best_index is None:
+                    if len(state["runs"]) > 0:
+                        losses_for_selection = [run["current_loss"] for run in state["runs"]]
+                        best_index = int(np.argmin(losses_for_selection))
+                        best_score = state["runs"][best_index]["current_loss"]
+                        selection_method = "train_loss_fallback"
+                    else:
+                        print("WARNING: No runs available for selection, using first run", flush=True)
                         best_index = 0
                         best_score = state["runs"][0]["current_loss"] if state["runs"] else float('inf')
-                        selection_method = "error_fallback"
-                    
-                    index = best_index
-                    selected_loss = best_score
-                    selected_run = state["runs"][index]
-                    eval_loss_val = selected_run.get("current_eval_loss", selected_run["current_loss"])
-                    train_loss_val = selected_run.get("current_train_loss", selected_run["current_loss"])
-                    print(f"BL (using {selection_method});{index};score={selected_loss:.6f};eval_loss={eval_loss_val:.6f};train_loss={train_loss_val:.6f};lr={state['lrs'][index]}", flush=True)
-                    
-                    c_train_info["train_request"]["checking_mode"] = "none"
-                    # Use the best checkpoint's train_cmd and output_dir
-                    # The trainer will automatically resume from the last checkpoint in that directory
-                    train_cmd = state["runs"][index]["train_cmd"]
-                    final_output_dir = state["runs"][index]["output_dir"]
-                    state["mode"] = "finish"
-            else: # the state = finish; no need to run more
-                assert state["mode"] == "finish"
-                break
+                        selection_method = "safety_fallback"
+
+                # Guard: invalid index
+                if best_index is None or best_index >= len(state["runs"]):
+                    print(f"ERROR: Invalid best_index {best_index}, falling back to run 0", flush=True)
+                    best_index = 0
+                    best_score = state["runs"][0]["current_loss"] if state["runs"] else float('inf')
+                    selection_method = "error_fallback"
+
+                index = best_index
+                selected_run = state["runs"][index]
+                eval_loss_val = selected_run.get("current_eval_loss", selected_run["current_loss"])
+                train_loss_val = selected_run.get("current_train_loss", selected_run["current_loss"])
+                lr_val = state["lrs"][index] if index < len(state.get("lrs", [])) else "N/A"
+                print(f"BL (using {selection_method});{index};score={best_score:.6f};eval_loss={eval_loss_val:.6f};train_loss={train_loss_val:.6f};lr={lr_val}", flush=True)
+
+                # Delete non-winning checkpoints AFTER the winner is known
+                delete_poor_checkpoints(state["runs"])
+
+                c_train_info["train_request"]["checking_mode"] = "none"
+                train_cmd = state["runs"][index]["train_cmd"]
+                final_output_dir = state["runs"][index]["output_dir"]
+                state["mode"] = "finish"
+
+        else:  # state == "finish" — nothing left to do
+            assert state["mode"] == "finish"
+            break
         
         set_state(state)
         if train_cmd:

@@ -220,7 +220,7 @@ def get_run_cmd(config: dict, gpu_nums: int, train_info: dict = None):
     --save_strategy no \
     --logging_steps 5 \
     --learning_rate {{learning_rate}} \
-    --weight_decay 0.01 \
+    --weight_decay {{weight_decay}} \
     --warmup_steps {warmup_steps} \
     --lr_scheduler_type cosine_with_min_lr \
     --lr_scheduler_kwargs "{{\\"min_lr_rate\\": {{min_lr_rate}}}}" \
@@ -282,7 +282,7 @@ def get_training_json(train_info: dict) -> dict:
         "epoch_num": 2,
         "batch_size": config["batch_size"],
         "learning_rate": config["lr"],
-        "min_lr_rate": 0.15,
+        "min_lr_rate": 0.05,
         "use_liger": get_use_liger(model_architecture),
         "optimizer": "paged_adamw_8bit",
         "use_lora": config.get("use_lora", False),
@@ -299,6 +299,8 @@ def get_training_json(train_info: dict) -> dict:
         "tensor_parallel": config.get("tensor_parallel", False),
         "use_4bit": config.get("use_4bit", False),
     }
+    # NOTE: weight_decay is computed AFTER all use_lora overrides (below) so it reads the
+    # final value of run_config["use_lora"], not the initial one from the config bucket.
 
     if model_name == "OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5":
         run_config["use_lora"] = True
@@ -323,8 +325,29 @@ def get_training_json(train_info: dict) -> dict:
     train_request = deepcopy(train_info)
     train_request["save_before_remaining_time"] = 3
     train_request["min_steps"] = 100
+    train_request["min_steps_per_epoch"] = train_request["min_steps"]
     train_request["adjust_batch_size"] = False
-    train_request["periodic_save_steps"] = 500
+    train_request["periodic_save_steps"] = 150  # finer checkpoint selection → lower test loss
+
+    # Adaptive checking_step: ~12 % of estimated total steps, clamped to [80, 400].
+    # Used by the multi-run LR race (first_time / second_time checking_mode).
+    dataset_size = None
+    try:
+        from model_utility import get_data_size
+        if train_info.get("request_path"):
+            dataset_size = get_data_size(train_info["request_path"])
+    except Exception:
+        pass
+    if dataset_size and dataset_size > 0:
+        bs  = run_config["batch_size"]
+        ga  = run_config["gradient_accumulation_steps"]
+        gn  = run_config["gpu_nums"]
+        ep  = run_config["epoch_num"]
+        est_steps = max(1, dataset_size * ep // (bs * ga * gn))
+        checking_step = max(80, min(400, int(est_steps * 0.12)))
+    else:
+        checking_step = 100
+    train_request["checking_step"] = checking_step
 
     if if_contain_slow_reward_function(train_info["dataset_type"]):
         train_request["save_before_remaining_time"] = 12
@@ -387,6 +410,10 @@ def get_training_json(train_info: dict) -> dict:
     base_lr = run_config["learning_rate"]
     run_config["learning_rate"] *= train_info["reg_ratio"]
     print(f"Applied reg_ratio: {base_lr:.8f} * {train_info['reg_ratio']:.6f} = {run_config['learning_rate']:.8f}", flush=True)
+
+    # Weight decay: computed here so it reflects ALL previous use_lora mutations.
+    # Full fine-tuning: stronger L2 regularization; LoRA: lighter decay (few adapter params).
+    run_config["weight_decay"] = 0.01 if run_config["use_lora"] else 0.05
 
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"], train_info)
 

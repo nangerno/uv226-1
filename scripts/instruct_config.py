@@ -381,7 +381,7 @@ def get_run_cmd(config: dict, gpu_nums: int, train_info: dict = None):
     --save_strategy epoch \
     --logging_steps 5 \
     --learning_rate {{learning_rate}} \
-    --weight_decay 0.01 \
+    --weight_decay {{weight_decay}} \
     --warmup_steps {warmup_steps} \
     --lr_scheduler_type cosine_with_min_lr \
     --lr_scheduler_kwargs "{{\\"min_lr_rate\\": {{min_lr_rate}}}}" \
@@ -536,7 +536,7 @@ def get_training_json(train_info: dict) -> dict:
         "epoch_num": 3,
         "batch_size": config["batch_size"],
         "learning_rate": config["lr"],
-        "min_lr_rate": 0.15,
+        "min_lr_rate": 0.05,  # 5 % floor gives the cosine schedule room to converge properly
         "use_liger": get_use_liger(model_architecture),
         "optimizer": "paged_adamw_8bit",
         "use_lora": config.get("use_lora", False),
@@ -579,8 +579,9 @@ def get_training_json(train_info: dict) -> dict:
             run_config["label_smoothing_factor"] = 0.05
             run_config["epoch_num"] = 2
             print(f"Time-aware optimization: Short job ({hours_to_complete:.2f}h) - adjusted grad_accum, light label_smoothing, 2 epochs", flush=True)
-        else:  # Longer jobs
-            run_config["label_smoothing_factor"] = 0.0  # Keep default
+        else:  # Longer jobs — label smoothing 0.05 universally reduces overconfidence
+            # and lowers test loss; memory cost is negligible for long-sequence models.
+            run_config["label_smoothing_factor"] = 0.05
 
     # there are models that do not support packing, so we need to check if the model supports packing
     if run_config["disable_fa"] == "True" or model_architecture.strip().lower() in [
@@ -590,47 +591,47 @@ def get_training_json(train_info: dict) -> dict:
 
     # data_size = get_data_size(train_info["request_path"])
 
-    # Batch size optimization: Increase when memory allows
-    # 1. When flash attention is disabled, we save memory and can use larger batches
+    # Batch size optimisation: collect all factors first, then apply as ONE combined multiplier
+    # capped at 2.5x.  Applying each factor sequentially causes dangerous stacking
+    # (e.g. FA-disabled × LoRA × short-seq × time-constrained × grad-ckpt ≈ 4x) that leads
+    # to OOM on the first attempt, wasting a full retry budget.
+    batch_factors: list[tuple[str, float]] = []
+
+    # 1. Flash-attention disabled → extra VRAM headroom
     if run_config["disable_fa"] == "True":
-        # Flash attention uses extra memory, so without it we can increase batch size
-        run_config["batch_size"] = int(run_config["batch_size"] * 1.5)
-        print(f"  [Batch Size] Flash attention disabled, increased batch size to {run_config['batch_size']}", flush=True)
-    
-    # 2. When using LoRA, we save significant memory and can use larger batches
+        batch_factors.append(("FA-disabled", 1.5))
+
+    # 2. LoRA → much less optimizer memory
     if run_config["use_lora"]:
-        # LoRA uses much less memory than full fine-tuning
-        run_config["batch_size"] = int(run_config["batch_size"] * 1.3)
-        print(f"  [Batch Size] LoRA enabled, increased batch size to {run_config['batch_size']}", flush=True)
-    
-    # 3. For shorter sequences, we can use larger batches
+        batch_factors.append(("LoRA", 1.3))
+
+    # 3. Short sequences → tokens-per-batch fit better
     if avg_seq_length and avg_seq_length > 0:
         if avg_seq_length < 512:
-            # Very short sequences - can use much larger batches
-            run_config["batch_size"] = int(run_config["batch_size"] * 1.5)
-            print(f"  [Batch Size] Short sequences (avg {avg_seq_length}), increased batch size to {run_config['batch_size']}", flush=True)
+            batch_factors.append((f"short-seq({avg_seq_length})", 1.4))
         elif avg_seq_length < 1024:
-            # Medium sequences - moderate increase
-            run_config["batch_size"] = int(run_config["batch_size"] * 1.2)
-            print(f"  [Batch Size] Medium sequences (avg {avg_seq_length}), increased batch size to {run_config['batch_size']}", flush=True)
-    
-    # 4. For time-constrained jobs, prioritize larger batches for faster training
+            batch_factors.append((f"medium-seq({avg_seq_length})", 1.15))
+
+    # 4. Time-constrained: fewer steps, so bigger batches help
     if hours_to_complete > 0 and hours_to_complete <= 1.0:
-        # Short jobs benefit from larger batches (fewer steps needed)
-        run_config["batch_size"] = int(run_config["batch_size"] * 1.2)
-        print(f"  [Batch Size] Time-constrained job ({hours_to_complete:.2f}h), increased batch size to {run_config['batch_size']}", flush=True)
-    
-    # 5. Allow manual batch size override via train_info
+        batch_factors.append((f"time-constrained({hours_to_complete:.2f}h)", 1.15))
+
+    # 5. Manual override
     if "batch_size_multiplier" in train_info:
-        multiplier = float(train_info["batch_size_multiplier"])
-        run_config["batch_size"] = int(run_config["batch_size"] * multiplier)
-        print(f"  [Batch Size] Manual multiplier ({multiplier}x), batch size: {run_config['batch_size']}", flush=True)
-    
-    # 6. When using gradient checkpointing, we save memory and can use larger batches
+        batch_factors.append(("manual", float(train_info["batch_size_multiplier"])))
+
+    # 6. Gradient checkpointing → slight VRAM saving
     if run_config["gradient_checkpointing"] == "True":
-        # Gradient checkpointing trades compute for memory
-        run_config["batch_size"] = int(run_config["batch_size"] * 1.15)
-        print(f"  [Batch Size] Gradient checkpointing enabled, increased batch size to {run_config['batch_size']}", flush=True)
+        batch_factors.append(("grad-ckpt", 1.1))
+
+    if batch_factors:
+        combined = 1.0
+        for _, f in batch_factors:
+            combined *= f
+        combined = min(combined, 2.5)  # hard cap — prevents OOM storms
+        run_config["batch_size"] = max(1, int(run_config["batch_size"] * combined))
+        labels = ", ".join(f"{lbl}×{f:.2f}" for lbl, f in batch_factors)
+        print(f"  [Batch Size] Combined multiplier {combined:.2f}x ({labels}) → {run_config['batch_size']}", flush=True)
 
     if model_name in FIXED_BS_CONFIG:
         run_config["batch_size"] = FIXED_BS_CONFIG[model_name]["batch_size"]
@@ -715,6 +716,10 @@ def get_training_json(train_info: dict) -> dict:
     if model_architecture.strip().lower() in ["gptossforcausallm"]:
         run_config["use_lora"] = False  # currently, gptoss does not support lora
 
+    # Weight decay: full fine-tuning trains billions of params and benefits from stronger L2;
+    # LoRA only trains a few million adapter params so 0.01 is sufficient.
+    run_config["weight_decay"] = 0.01 if run_config["use_lora"] else 0.05
+
     # OPTIMIZATION: Lookup LR was already checked and used above, so no need to check again
     # The LR in run_config is already set from config["lr"] which uses lookup if available
     # (Note: use_lookup_lr is set in the block above, so we can check train_info directly here)
@@ -730,8 +735,21 @@ def get_training_json(train_info: dict) -> dict:
     train_request = deepcopy(train_info)
     train_request["save_before_remaining_time"] = 3
     train_request["adjust_batch_size"] = False
-    train_request["periodic_save_steps"] = 500
-    train_request["checking_step"] = 80
+    # Finer save granularity = finer checkpoint selection = lower test loss.
+    # 150 steps gives ≈10-30 candidate checkpoints for a typical run; the best-by-val-loss
+    # one is always at most 150 steps away from the true minimum, not 500.
+    train_request["periodic_save_steps"] = 150
+    # Adaptive checking_step: ~12 % of estimated total steps, clamped to [80, 400].
+    # dataset_size may have been fetched earlier in get_training_json; reuse it here.
+    if dataset_size and dataset_size > 0:
+        bs  = run_config["batch_size"]
+        ga  = run_config["gradient_accumulation_steps"]
+        gn  = run_config["gpu_nums"]
+        ep  = run_config["epoch_num"]
+        est_steps = max(1, dataset_size * ep // (bs * ga * gn))
+        train_request["checking_step"] = max(80, min(400, int(est_steps * 0.12)))
+    else:
+        train_request["checking_step"] = 80
 
     # Short-job mode: reduce save/check overhead.
     if hours_to_complete > 0 and hours_to_complete <= 0.75:
@@ -746,5 +764,7 @@ def get_training_json(train_info: dict) -> dict:
         train_request["min_steps"] = max(
             int(train_info["hours_to_complete"] * 70), train_request["min_steps"]
         )
+
+    train_request["min_steps_per_epoch"] = train_request["min_steps"]
 
     return {"train_request": train_request, "run_cmd": run_cmd}
