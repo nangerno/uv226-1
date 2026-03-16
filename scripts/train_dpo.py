@@ -1,7 +1,4 @@
 from typing import Dict, Optional
-import os
-# Set CUDA memory allocation config before importing torch to reduce fragmentation
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import requests
 import json
 import random
@@ -28,7 +25,7 @@ from peft import (
 from transformers import TrainerCallback
 import argparse
 import os
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb, EarlyStoppingCallback
+from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
 from state_manager import get_state, set_state
 
 # from packing.packed_dataset import PackedDataset
@@ -130,10 +127,6 @@ def main():
     training_args, model_args = parser.parse_args_and_config()
     train_info = json.load(open(training_args.request_path, "r"))
     train_request = train_info["train_request"]
-    min_steps_per_epoch = train_request.get(
-        "min_steps_per_epoch", train_request["min_steps"]
-    )
-    train_request["min_steps_per_epoch"] = min_steps_per_epoch
 
     # check if need to run early stop or not
     task_id = train_request["task_id"]
@@ -152,8 +145,6 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    # Ensure consistent padding side for causal LMs (matches validator)
-    tokenizer.padding_side = "left"  # Left padding for causal LMs
 
     # max_length = get_max_length_config()
     # if "max_length" in train_request:
@@ -180,7 +171,7 @@ def main():
     max_batch_size_theory = len(train_ds) / (
         training_args.gradient_accumulation_steps
         * training_args.world_size
-        * min_steps_per_epoch
+        * train_request["min_steps"]
     )
     max_batch_size_theory = int(max_batch_size_theory)
     if max_batch_size_theory == 0:
@@ -272,9 +263,7 @@ def main():
     print("train_ds.column_names: ", train_ds.column_names)
 
     max_steps = train_request.get("max_steps", -1)
-    training_args.max_steps = max_steps if max_steps and max_steps > 0 else -1
-    log_info(f"min_steps_per_epoch: {min_steps_per_epoch}")
-    log_info(f"effective max_steps: {training_args.max_steps}")
+    log_info(f"max_steps: {max_steps}")
     
     start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     state = get_state()
@@ -302,32 +291,6 @@ def main():
         checking_step = total_steps_per_epoch - 2
     
 
-    # Get model architecture and params for metadata
-    model_architecture = None
-    model_params = None
-    try:
-        from model_utility import get_model_architecture, get_model_num_params
-        model_architecture = get_model_architecture(train_request["model_path"])
-        model_params = get_model_num_params(train_request["model_name"], train_request["model_path"])
-    except:
-        pass
-    
-    # Prepare metadata for LR lookup update
-    metadata = {
-        "batch_size": training_args.per_device_train_batch_size,
-        "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
-        "gpu_count": training_args.world_size,
-        "use_lora": peft_config is not None,
-        "lora_rank": getattr(peft_config, 'r', None) if peft_config else None,
-        "max_length": train_request.get("max_length"),
-        "epochs": training_args.num_train_epochs,
-        "warmup_steps": training_args.warmup_steps,
-        "hours_to_complete": train_request.get("hours_to_complete"),
-        "architecture": model_architecture,
-        "model_params": model_params,
-        "reg_ratio": train_info.get("reg_ratio") if "reg_ratio" in train_info else None,
-    }
-    
     trainer = DPOTrainer(
         model=model,
         ref_model=ref_model,
@@ -347,21 +310,14 @@ def main():
                 total_steps_all_epochs=total_steps_all_epochs,
                 end_time=train_request["end_time"],
                 checking_mode=train_request.get("checking_mode", "none"),
-                task_type="DpoTask",
-                update_lr_lookup=train_request.get("find_lk_lr", True),
-                metadata=metadata
-            ),
-            EarlyStoppingCallback(patience=8, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
+                early_stopping_patience=train_request.get("early_stopping_patience", 250)
+            )
         ],
     )
     
-    print("Start training ...", flush=True)
-    # Automatically resume from last checkpoint if one exists
-    from transformers.trainer_utils import get_last_checkpoint
-    last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    if last_checkpoint:
-        log_info(f"Resuming from checkpoint: {last_checkpoint}")
-    trainer.train(resume_from_checkpoint=last_checkpoint if last_checkpoint else None)
+    print("Start training ...", flush=True)       
+    # trainer.train()
+    trainer.train()
     
     if is_main_process(LOCAL_RANK):
         with open(os.path.join(training_args.output_dir, "success.txt"), "w") as f:

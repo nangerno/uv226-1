@@ -9,7 +9,7 @@ strict: false
 chat_template: llama3
 datasets:
 dataset_prepared_path:
-val_set_size: 0.05
+val_set_size: 0.12
 output_dir: miner_id_24
 
 rl: grpo

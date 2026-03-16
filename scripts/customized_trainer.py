@@ -10,7 +10,6 @@ import os
 from typing import Callable, Optional, Dict
 import shutil
 import json
-import math
 from transformers.trainer_utils import is_main_process
 import wandb
 import torch
@@ -35,7 +34,7 @@ ERROR_GENERATION_CONFIG_MODELS = [
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
 print(f"LOCAL_RANK: {LOCAL_RANK} in customized_trainer.py", flush=True)
-
+    
 class CustomEvalSaveCallback(TrainerCallback):
     def __init__(
         self,
@@ -48,9 +47,7 @@ class CustomEvalSaveCallback(TrainerCallback):
         total_steps_all_epochs: int = -1,
         end_time: str = "",
         checking_mode: str = "none",
-        task_type: str = None,
-        update_lr_lookup: bool = True,
-        metadata: Optional[Dict] = None
+        early_stopping_patience: int = 200
     ):
         self.function_when_to_evaluate = function_when_to_evaluate
         self.submission_dir = submission_dir
@@ -66,194 +63,60 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.total_steps_all_epochs = total_steps_all_epochs
         self.checking_mode = checking_mode
         self.end_time = end_time
-        self.task_type = task_type  # For LR lookup update
-        self.update_lr_lookup = update_lr_lookup  # Flag to enable/disable automatic updates
-        self.metadata = metadata or {}  # Additional metadata for LR lookup
-        self._capture_eval_loss_at_checking = False
-        self._checking_step_eval_loss = None
-        # DECISIVE: Track top 3 checkpoints for interpolation (improved from 2)
-        self.top_checkpoints = []  # List of (step, eval_loss, train_loss, generalization_score)
-        self.max_top_checkpoints = 3  # Track top 3 for better ensemble
-        # FRESH: Smart checkpoint pruning - track predicted quality
-        self.checkpoint_predictions = {}  # step -> predicted_loss
-        self.max_prediction_window = 300  # Keep predictions for next 300 steps max
-        self.last_eval_loss = None
-        self.eval_loss_trend = []  # Track trend for prediction
-        # FRESH: Incremental evaluation - track subset evaluations
-        self.subset_eval_results = {}  # step -> subset_eval_loss
-        self.skip_full_eval_threshold = 1.1  # Skip full eval if subset loss > best * this
+        self.early_stopping_patience = early_stopping_patience
+        self.steps_without_improvement = 0
+        self.last_improvement_step = 0
+        self.best_composite_score = None
+        self.top_checkpoints = []  # Store top 3-5 checkpoints
+        self.max_top_checkpoints = 3
         
     def compute_loss(self, state: TrainerState, metrics):
         return metrics.get("eval_loss", None)
     
-    def cleanup_checkpoint_predictions(self, current_step: int):
-        if not self.checkpoint_predictions:
-            return
+    def compute_composite_score(self, state: TrainerState, metrics):
+        """
+        Compute a composite score that considers multiple factors:
+        - eval_loss (primary, 70% weight)
+        - generalization gap (train_loss - eval_loss, 20% weight) - penalize overfitting
+        - step penalty (10% weight) - slightly prefer later checkpoints if similar loss
+        """
+        eval_loss = metrics.get("eval_loss", None)
+        if eval_loss is None:
+            return None
         
-        # Remove predictions for steps that have already passed
-        steps_to_remove = [step for step in self.checkpoint_predictions.keys() if step < current_step]
-        for step in steps_to_remove:
-            del self.checkpoint_predictions[step]
-        
-        # Keep only predictions within the prediction window (next max_prediction_window steps)
-        max_future_step = current_step + self.max_prediction_window
-        steps_to_remove_future = [step for step in self.checkpoint_predictions.keys() if step > max_future_step]
-        for step in steps_to_remove_future:
-            del self.checkpoint_predictions[step]
-        
-        if steps_to_remove or steps_to_remove_future:
-            remaining_count = len(self.checkpoint_predictions)
-            print(f"  [Cleanup] Removed {len(steps_to_remove)} past and {len(steps_to_remove_future)} far-future predictions. Remaining: {remaining_count}", flush=True)
-    
-    def compute_generalization_score(self, eval_loss: float, state: TrainerState, metrics: Dict) -> tuple:
-        # Extract task-specific training metric
-        train_metric = None
-        eval_metric = eval_loss
-        
+        # Get current training loss from log history
+        train_loss = None
         if state.log_history:
-            last_log = state.log_history[-1]
-            train_metric = last_log.get("loss", None)
+            # Get the most recent training loss
+            for log_entry in reversed(state.log_history):
+                if "loss" in log_entry and "eval_loss" not in log_entry:
+                    train_loss = log_entry.get("loss", None)
+                    break
         
-        # Base generalization score starts with eval metric
-        generalization_score = eval_loss
-        overfitting_penalty = 0.0
+        # Base score is eval_loss (lower is better)
+        composite_score = eval_loss
         
-        # Task-specific overfitting detection and penalty calculation
-        if self.task_type and "GrpoTask" in self.task_type:
-            # GRPO: Reward-based task - overfitting when train_reward >> eval_reward
-            # eval_loss is already negated reward (from compute_loss), so lower is better
-            # train_reward would be in log_history as "reward" or we need to extract it differently
-            train_reward = None
-            if state.log_history:
-                # Look for train reward in log_history
-                for log_entry in reversed(state.log_history):
-                    if "reward" in log_entry and "eval_reward" not in log_entry:
-                        train_reward = log_entry.get("reward", None)
-                        break
-                    # Also check if loss represents reward (for GRPO, sometimes loss is negated reward)
-                    if "loss" in log_entry and "eval_loss" not in log_entry:
-                        # For GRPO, training loss might be negated reward
-                        # We need to check if this is actually a reward metric
-                        potential_reward = log_entry.get("loss", None)
-                        if potential_reward is not None:
-                            # If loss is negative, it might be a reward (GRPO rewards are often positive)
-                            # But we can't be sure without task context, so we'll use a heuristic
-                            # Actually, for GRPO, we should look for explicit reward metrics
-                            pass
-            
-            if train_reward is not None:
-                train_metric = train_reward  # Store for return value
-                eval_reward = -eval_loss  # Convert back to reward space
-                eval_metric = eval_reward  # Update eval_metric for consistency
-                
-                # For GRPO: overfitting = train_reward >> eval_reward
-                # Reward gap: positive when train_reward > eval_reward (overfitting)
-                reward_gap = max(0, train_reward - eval_reward)
-                
-                # Calculate gap ratio (in reward space for interpretability)
-                # Higher ratio = more overfitting (train_reward >> eval_reward)
-                if eval_reward > 0:
-                    reward_gap_ratio = train_reward / eval_reward
-                elif train_reward > 0:
-                    # Eval reward is negative or zero, but train is positive = severe overfitting
-                    reward_gap_ratio = float('inf')
-                else:
-                    # Both negative or zero, use absolute difference normalized
-                    reward_gap_ratio = abs(train_reward - eval_reward) / max(abs(eval_reward), 0.01) if abs(eval_reward) > 0.01 else 1.0
-                
-                # Adaptive penalty for GRPO (similar structure but reward-aware)
-                # For rewards: penalty when train_reward >> eval_reward
-                if reward_gap_ratio >= 1.5:  # Train reward 50%+ higher than eval
-                    penalty_factor = 0.7  # Very strong penalty
-                elif reward_gap_ratio >= 1.3:
-                    penalty_factor = 0.5  # Strong penalty
-                elif reward_gap_ratio >= 1.15:
-                    penalty_factor = 0.35  # Moderate penalty
-                else:
-                    penalty_factor = 0.2  # Light penalty
-                
-                # Convert reward gap to loss space for penalty
-                # reward_gap is in reward space, convert to loss: loss_gap = -reward_gap
-                # But we want positive penalty, so scale reward_gap appropriately
-                # Since eval_loss = -eval_reward, we can use reward_gap directly
-                overfitting_penalty = penalty_factor * reward_gap
-                # Higher overfitting should make the score worse, not better.
-                generalization_score = eval_loss + overfitting_penalty
-                
-                print(f"  [GRPO] train_reward={train_reward:.6f}, eval_reward={eval_reward:.6f}, reward_gap={reward_gap:.6f}, reward_gap_ratio={reward_gap_ratio:.3f}, penalty_factor={penalty_factor:.2f}, overfitting_penalty={overfitting_penalty:.6f}", flush=True)
-            else:
-                # No train reward available, use eval_loss only
-                eval_reward = -eval_loss  # Convert back to reward space for consistency
-                eval_metric = eval_reward  # Update eval_metric
-                print(f"  [GRPO] No train_reward available, using eval_reward only", flush=True)
-                train_metric = None
+        # Add generalization gap penalty (if train_loss is much lower than eval_loss, penalize overfitting)
+        if train_loss is not None and eval_loss > 0:
+            generalization_gap = max(0, eval_loss - train_loss)  # How much higher eval is than train
+            # Normalize gap relative to eval_loss (penalize if gap > 10% of eval_loss)
+            gap_ratio = generalization_gap / eval_loss
+            # Penalize if gap is significant (more than 10% of eval_loss)
+            if gap_ratio > 0.1:
+                composite_score += 0.15 * gap_ratio * eval_loss  # Scale penalty by gap ratio
         
-        elif self.task_type and "DpoTask" in self.task_type:
-            # DPO: Loss-based task, but could also consider preference accuracy if available
-            train_loss = train_metric
-            preference_accuracy = None
-            
-            # Check for preference accuracy metric (if available)
-            if state.log_history:
-                for log_entry in reversed(state.log_history):
-                    if "eval_preference_accuracy" in log_entry or "preference_accuracy" in log_entry:
-                        preference_accuracy = log_entry.get("eval_preference_accuracy") or log_entry.get("preference_accuracy")
-                        break
-            
-            if train_loss is not None and train_loss > 0:
-                overfitting_gap = max(0, eval_loss - train_loss)
-                gap_ratio = eval_loss / train_loss if train_loss > 0 else float('inf')
-                
-                # Adaptive penalty factor (same as before for DPO)
-                if gap_ratio >= 2.0:
-                    penalty_factor = 0.7
-                elif gap_ratio >= 1.5:
-                    penalty_factor = 0.5
-                elif gap_ratio >= 1.2:
-                    penalty_factor = 0.35
-                else:
-                    penalty_factor = 0.2
-                
-                overfitting_penalty = penalty_factor * overfitting_gap
-                generalization_score = eval_loss + overfitting_penalty
-                
-                # Optional: Adjust based on preference accuracy if available
-                if preference_accuracy is not None:
-                    # Lower accuracy suggests worse generalization
-                    # Adjust penalty: if accuracy is low, increase penalty slightly
-                    if preference_accuracy < 0.6:  # Less than 60% accuracy
-                        accuracy_penalty_multiplier = 1.1
-                        overfitting_penalty *= accuracy_penalty_multiplier
-                        generalization_score = eval_loss + overfitting_penalty
-                        print(f"  [DPO] preference_accuracy={preference_accuracy:.3f} (low), adjusted penalty", flush=True)
-                
-                print(f"  [DPO] gap_ratio={gap_ratio:.3f}, overfitting_gap={overfitting_gap:.6f}, penalty_factor={penalty_factor:.2f}", flush=True)
-            else:
-                print(f"  [DPO] No train_loss available, using eval_loss only", flush=True)
+        # Slight preference for later checkpoints if scores are very close (within 1%)
+        # This helps select more trained models when loss is similar
+        step_bonus = 0.0
+        if self.best_composite_score is not None:
+            score_diff = abs(composite_score - self.best_composite_score) / max(abs(self.best_composite_score), 1e-8)
+            if score_diff < 0.01:  # Within 1% of best score
+                # Prefer later checkpoint by small amount
+                step_bonus = -0.001 * (state.global_step / max(self.total_steps_all_epochs, 1))
         
-        else:
-            # Default: Instruct/Chat tasks - loss-based
-            train_loss = train_metric
-            if train_loss is not None and train_loss > 0:
-                overfitting_gap = max(0, eval_loss - train_loss)
-                gap_ratio = eval_loss / train_loss if train_loss > 0 else float('inf')
-                
-                # Adaptive penalty factor
-                if gap_ratio >= 2.0:
-                    penalty_factor = 0.7
-                elif gap_ratio >= 1.5:
-                    penalty_factor = 0.5
-                elif gap_ratio >= 1.2:
-                    penalty_factor = 0.35
-                else:
-                    penalty_factor = 0.2
-                
-                overfitting_penalty = penalty_factor * overfitting_gap
-                generalization_score = eval_loss + overfitting_penalty
-            else:
-                print(f"  [Instruct/Chat] No train_loss available, using eval_loss only", flush=True)
+        composite_score += step_bonus
         
-        return generalization_score, overfitting_penalty, train_metric, eval_metric
+        return composite_score
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
         # Custom logic to decide whether to save or evaluate
@@ -307,9 +170,8 @@ class CustomEvalSaveCallback(TrainerCallback):
             }
             if n > 0: # we should try more 
                 log_content += f"\nEstimated number of steps to complete the training: {n}"
-                # Don't save at first_time checking to save time and space (match top miner)
-                control.should_save = False
                 control.should_training_stop = True
+                control.should_save = False
                 args.save_strategy = "no"
                 # save the current loss of this step to the state;
                 last_log = state.log_history[-1]
@@ -333,43 +195,36 @@ class CustomEvalSaveCallback(TrainerCallback):
             my_state = get_state()
             current_loss = state.log_history[-1]["loss"]
             my_state["train"]["current_loss"] = current_loss
-            
-            # CRITICAL: Trigger evaluation to get eval_loss for better checkpoint selection
-            # This is the key improvement - use eval_loss instead of train_loss for selection
-            print(f"Triggering evaluation at checking_step {state.global_step} to get eval_loss for multi-run selection", flush=True)
-            control.should_evaluate = True
-            control.should_save = True  # Need to save to get eval metrics
-            # Store flag to capture eval_loss after evaluation
-            self._capture_eval_loss_at_checking = True
-            self._checking_step_eval_loss = None
                 
-            # Stop training temporarily to wait for evaluation to complete
-            # We'll decide in on_evaluate whether to continue or stop based on eval_loss
             control.should_training_stop = True
+
+            # Check if current_loss > current min_loss --> do not save to save time and space
+            # 
+            # if my_state["train"]["current_loss"] > current_min_loss:
+            #     print(f"Current loss: {my_state['train']['current_loss']} is greater than the current min_loss: {current_min_loss}, do not save the checkpoint", flush=True)
+            #     control.should_save = False
+            # check if this is the last run and the current_loss is the lowest --> keep running the training
+            current_is_the_best = False
+            current_min_loss = min([run["current_loss"] for run in my_state["runs"]])
+            if current_loss <= current_min_loss:
+                if len(my_state["runs"]) + 1 == my_state["next_runs"]:
+                    print(f"Current loss: {my_state['train']['current_loss']} is greater than: {current_min_loss}", flush=True)
+                    current_is_the_best = True
+                    
+            if current_is_the_best:
+                control.should_training_stop = False
+                my_state["mode"] = "finish"
+            else:
+                control.should_save = False
+                args.save_strategy = "no"
             
             if is_main_process(LOCAL_RANK):
                 set_state(my_state)
-                print(log_content, flush=True)
+                # print(log_content, flush=True)
         
             
         when_to_eval = self.function_when_to_evaluate(state.global_step)
         if when_to_eval["eval"]:
-            # Clean up old predictions periodically (every evaluation check)
-            self.cleanup_checkpoint_predictions(state.global_step)
-            
-            # FRESH: Smart checkpoint pruning - predict quality before evaluating
-            # If predicted to be poor, skip evaluation to save time
-            if state.global_step in self.checkpoint_predictions:
-                predicted_loss = self.checkpoint_predictions[state.global_step]
-                best_loss = self.best_checkpoint_info["loss"] if self.best_checkpoint_info else float('inf')
-                if predicted_loss > best_loss * 1.15:  # 15% worse than best
-                    print(f"FRESH: Skipping evaluation at step {state.global_step} - predicted loss {predicted_loss:.6f} is poor (best: {best_loss:.6f})", flush=True)
-                    # Remove the prediction after using it
-                    del self.checkpoint_predictions[state.global_step]
-                    control.should_evaluate = False
-                    control.should_save = False  # Don't save poor checkpoints
-                    return control
-            
             # do not allow the pod to be stopped by any reason 
                 # first check if there is at least one checkpoint or not 
             print(f"Evaluating the model at step: {state.global_step} the reason: {when_to_eval['reason']}", flush=True)
@@ -387,278 +242,68 @@ class CustomEvalSaveCallback(TrainerCallback):
         self, args, state: TrainerState, control: TrainerControl, metrics, **kwargs
     ):
         self.save_only = False
-        # Clean up old predictions at the start of evaluation
-        self.cleanup_checkpoint_predictions(state.global_step)
-        
-        # Use eval_loss (which is cross-entropy) for checkpoint selection
-        # This directly optimizes for test_loss which is also cross-entropy
+        # Append eval_loss to file
         eval_loss = self.compute_loss(state, metrics)
         if state.global_step < 2:
-            return control 
-        
-        # FRESH: Incremental evaluation - check if this is a subset evaluation
-        # If subset loss is poor, skip full evaluation to save time
-        is_subset_eval = metrics.get("_is_subset_eval", False)
-        if is_subset_eval:
-            subset_loss = eval_loss
-            self.subset_eval_results[state.global_step] = subset_loss
-            print(f"FRESH: Subset evaluation at step {state.global_step}: loss={subset_loss:.6f}", flush=True)
-            
-            # Predict if full evaluation is worth it
-            best_loss = self.best_checkpoint_info["loss"] if self.best_checkpoint_info else float('inf')
-            if subset_loss > best_loss * self.skip_full_eval_threshold:
-                print(f"FRESH: Skipping full evaluation - subset loss {subset_loss:.6f} > best {best_loss:.6f} * {self.skip_full_eval_threshold}", flush=True)
-                # Don't do full evaluation, just return
-                return control
-            else:
-                print(f"FRESH: Subset loss {subset_loss:.6f} is promising, proceeding with full evaluation", flush=True)
-        
+            return 
         print(f"GO INTO CUSTOMIZED EVALUATE AT STEP: {state.global_step}", flush=True)
         
-        # FRESH: Smart checkpoint pruning - predict quality early
-        if eval_loss is not None:
-            # Track eval loss trend for prediction
-            if self.last_eval_loss is not None:
-                trend = eval_loss - self.last_eval_loss
-                self.eval_loss_trend.append(trend)
-                # Keep only last 5 trends
-                if len(self.eval_loss_trend) > 5:
-                    self.eval_loss_trend = self.eval_loss_trend[-5:]
-                
-                # Predict next checkpoint quality based on trend
-                if len(self.eval_loss_trend) >= 2:
-                    avg_trend = sum(self.eval_loss_trend[-3:]) / min(3, len(self.eval_loss_trend))
-                    predicted_next_loss = eval_loss + avg_trend
-                    predicted_step = state.global_step + 100
-                    
-                    # Only store prediction if it's within the prediction window
-                    if predicted_step <= state.global_step + self.max_prediction_window:
-                        self.checkpoint_predictions[predicted_step] = predicted_next_loss
-                        # Clean up after adding new prediction
-                        self.cleanup_checkpoint_predictions(state.global_step)
-                    else:
-                        print(f"  [Prediction] Skipping prediction for step {predicted_step} (beyond window of {self.max_prediction_window} steps)", flush=True)
-                    
-                    # If predicted loss is very poor, suggest early stopping
-                    best_loss = self.best_checkpoint_info["loss"] if self.best_checkpoint_info else eval_loss
-                    if predicted_next_loss > best_loss * 1.15:  # 15% worse
-                        print(f"FRESH: Predicted next checkpoint will be poor (predicted={predicted_next_loss:.6f} vs best={best_loss:.6f}), consider early stopping", flush=True)
-            
-            self.last_eval_loss = eval_loss
+        # Compute composite score for better checkpoint selection
+        composite_score = self.compute_composite_score(state, metrics)
+        if composite_score is None:
+            composite_score = eval_loss  # Fallback to eval_loss if composite can't be computed
         
-        # CRITICAL: Store eval_loss and train_loss at checking_step for multi-run selection
-        if hasattr(self, '_capture_eval_loss_at_checking') and self._capture_eval_loss_at_checking:
-            if state.global_step == self.checking_step and self.checking_mode == "second_time":
-                if eval_loss is not None:
-                    # Extract train_loss from log_history for storage
-                    train_loss_for_storage = None
-                    if state.log_history:
-                        last_log = state.log_history[-1]
-                        train_loss_for_storage = last_log.get("loss", None)
-                    
-                    my_state = get_state()
-                    my_state["train"]["current_eval_loss"] = eval_loss
-                    # IMPROVED: Also store train_loss for generalization_score calculation
-                    if train_loss_for_storage is not None:
-                        my_state["train"]["current_train_loss"] = train_loss_for_storage
-                    
-                    # Task-specific: Store reward metrics for GRPO
-                    if self.task_type and "GrpoTask" in self.task_type:
-                        my_state["train"]["current_eval_reward"] = -eval_loss  # Convert back to reward
-                        # Try to get train_reward
-                        train_reward_for_storage = None
-                        if state.log_history:
-                            for log_entry in reversed(state.log_history):
-                                if "reward" in log_entry and "eval_reward" not in log_entry:
-                                    train_reward_for_storage = log_entry.get("reward", None)
-                                    break
-                        if train_reward_for_storage is not None:
-                            my_state["train"]["current_train_reward"] = train_reward_for_storage
-                        print(f"CRITICAL: [GRPO] Stored eval_reward {-eval_loss:.6f} and train_reward {train_reward_for_storage:.6f if train_reward_for_storage else None} at checking_step {state.global_step} for multi-run selection", flush=True)
-                    else:
-                        print(f"CRITICAL: Stored eval_loss {eval_loss:.6f} and train_loss {train_loss_for_storage:.6f if train_loss_for_storage else None} at checking_step {state.global_step} for multi-run selection", flush=True)
-                    
-                    # Now make decision based on eval_loss instead of train_loss
-                    current_is_the_best = False
-                    control.should_training_stop = True
-                    
-                    if "runs" in my_state and len(my_state["runs"]) > 0:
-                        # Use eval_loss for comparison (CRITICAL IMPROVEMENT)
-                        if all("current_eval_loss" in run for run in my_state["runs"]):
-                            current_min_eval_loss = min([run.get("current_eval_loss", run["current_loss"]) for run in my_state["runs"]])
-                            comparison_loss = eval_loss
-                            print(f"Comparing eval_loss: {eval_loss:.6f} vs best eval_loss: {current_min_eval_loss:.6f}", flush=True)
-                        else:
-                            # Fallback: compare with train_loss if eval_loss not available in previous runs
-                            current_min_loss = min([run["current_loss"] for run in my_state["runs"]])
-                            comparison_loss = eval_loss  # Still use eval_loss for this run
-                            current_min_eval_loss = current_min_loss
-                            print(f"Comparing eval_loss: {eval_loss:.6f} vs best train_loss: {current_min_eval_loss:.6f} (fallback)", flush=True)
-                        
-                        if eval_loss <= current_min_eval_loss:
-                            if len(my_state["runs"]) + 1 == my_state["next_runs"]:
-                                print(f"CRITICAL: Eval loss {eval_loss:.6f} is best or equal to best {current_min_eval_loss:.6f}, continuing training", flush=True)
-                                current_is_the_best = True
-                            else:
-                                print(f"Eval loss {eval_loss:.6f} is best, but not last run. Will continue with next LR.", flush=True)
-                        else:
-                            # Adaptive early termination: if eval_loss is significantly worse, stop early
-                            if eval_loss > current_min_eval_loss * 1.2:  # 20% worse
-                                print(f"ADAPTIVE TERMINATION: Eval loss {eval_loss:.6f} is >20% worse than best {current_min_eval_loss:.6f}, stopping early", flush=True)
-                                control.should_training_stop = True
-                            else:
-                                print(f"Eval loss {eval_loss:.6f} is worse than best {current_min_eval_loss:.6f}, stopping this run", flush=True)
-                    else:
-                        # First run in the series
-                        if my_state.get("next_runs", 1) == 1:
-                            current_is_the_best = True
-                            print(f"Only one run, continuing training", flush=True)
-                    
-                    if current_is_the_best:
-                        control.should_training_stop = False
-                        my_state["mode"] = "finish"
-                    else:
-                        # Don't save if not best to save time and space
-                        control.should_save = False
-                    
-                    if is_main_process(LOCAL_RANK):
-                        set_state(my_state)
-                    self._capture_eval_loss_at_checking = False
-                    self._checking_step_eval_loss = eval_loss
-                    
-                    return control
+        # Initialize last_improvement_step on first evaluation if not set
+        if self.last_improvement_step == 0:
+            self.last_improvement_step = state.global_step
         
-        # IMPROVED: Task-aware overfitting detection and early stopping
-        overfitting_detected = False
-        if state.log_history:
-            if self.task_type and "GrpoTask" in self.task_type:
-                # GRPO: Check reward gap (train_reward >> eval_reward = overfitting)
-                last_train_reward = None
-                for log_entry in reversed(state.log_history):
-                    if "reward" in log_entry and "eval_reward" not in log_entry:
-                        last_train_reward = log_entry.get("reward", None)
-                        break
-                
-                if last_train_reward is not None and eval_loss is not None:
-                    eval_reward = -eval_loss  # Convert back to reward space
-                    # Calculate reward gap ratio (handle edge cases)
-                    if eval_reward > 0:
-                        reward_gap_ratio = last_train_reward / eval_reward
-                    elif last_train_reward > 0:
-                        # Eval reward is negative/zero but train is positive = severe overfitting
-                        reward_gap_ratio = float('inf')
-                    else:
-                        # Both negative or zero, use absolute difference normalized
-                        reward_gap_ratio = abs(last_train_reward - eval_reward) / max(abs(eval_reward), 0.01) if abs(eval_reward) > 0.01 else 1.0
-                    
-                    # For GRPO: overfitting when train_reward is much higher than eval_reward
-                    if reward_gap_ratio > 1.5:  # Train reward 50%+ higher than eval
-                            overfitting_detected = True
-                            print(f"WARNING: [GRPO] Overfitting detected! Train reward: {last_train_reward:.6f}, Eval reward: {eval_reward:.6f}, Ratio: {reward_gap_ratio:.2f}", flush=True)
-                            
-                            if reward_gap_ratio > 2.0 and self.best_checkpoint_info is not None:
-                                best_eval = self.best_checkpoint_info.get("loss", float('inf'))
-                                if eval_loss > best_eval * 1.1:
-                                    print(f"SEVERE OVERFITTING [GRPO]: Stopping early (reward_gap_ratio={reward_gap_ratio:.2f}, eval_loss={eval_loss:.6f} vs best={best_eval:.6f})", flush=True)
-                                    control.should_training_stop = True
-                                    return control
-            else:
-                # Loss-based tasks (Instruct, DPO, Chat)
-                last_train_loss = state.log_history[-1].get("loss", None)
-                if last_train_loss and eval_loss:
-                    gap_ratio = eval_loss / last_train_loss if last_train_loss > 0 else float('inf')
-                    if gap_ratio > 2.0:  # Eval loss is 2x train loss = overfitting
-                        overfitting_detected = True
-                        task_label = "[DPO]" if self.task_type and "DpoTask" in self.task_type else "[Instruct/Chat]"
-                        print(f"WARNING: {task_label} Overfitting detected! Train loss: {last_train_loss:.6f}, Eval loss: {eval_loss:.6f}, Ratio: {gap_ratio:.2f}", flush=True)
-                        
-                        # IMPROVED: More aggressive early stopping when severe overfitting detected
-                        if gap_ratio > 2.5 and self.best_checkpoint_info is not None:
-                            best_eval = self.best_checkpoint_info.get("loss", float('inf'))
-                            if eval_loss > best_eval * 1.1:  # Current eval is 10% worse than best
-                                print(f"SEVERE OVERFITTING {task_label}: Stopping early to prevent further degradation (gap_ratio={gap_ratio:.2f}, eval_loss={eval_loss:.6f} vs best={best_eval:.6f})", flush=True)
-                                control.should_training_stop = True
-                                return control
-        
-        # DECISIVE: Overfitting-aware checkpoint selection (task-aware)
-        # Use task-specific generalization score calculation
-        if eval_loss is not None:
-            generalization_score, overfitting_penalty, train_metric, eval_metric = self.compute_generalization_score(
-                eval_loss, state, metrics
-            )
+        # Check if this is a better checkpoint using composite score
+        if self.best_composite_score is None or composite_score < self.best_composite_score:
+            improvement = self.best_composite_score - composite_score if self.best_composite_score is not None else composite_score
+            print(f"*** NEW BEST CHECKPOINT at step {state.global_step} ***", flush=True)
+            print(f"  Eval Loss: {eval_loss:.6f}", flush=True)
+            print(f"  Composite Score: {composite_score:.6f}", flush=True)
+            if self.best_composite_score is not None:
+                print(f"  Improvement: {improvement:.6f} ({improvement/abs(self.best_composite_score)*100:.2f}%)", flush=True)
             
-            # Log task-specific metrics
-            if self.task_type and "GrpoTask" in self.task_type:
-                print(f"Step {state.global_step}: eval_reward={-eval_loss:.6f}, train_reward={train_metric:.6f if train_metric else None}, generalization_score={generalization_score:.6f}", flush=True)
-            else:
-                train_loss = train_metric
-                print(f"Step {state.global_step}: eval_loss={eval_loss:.6f}, train_loss={train_loss:.6f if train_loss else None}, generalization_score={generalization_score:.6f}", flush=True)
-            
-            # Update best checkpoint using generalization_score (not just eval_loss)
-            should_update = False
-            if self.best_checkpoint_info is None:
-                should_update = True
-            else:
-                # Compare using generalization_score for better generalization
-                current_best_score = self.best_checkpoint_info.get("generalization_score", self.best_checkpoint_info["loss"])
-                if generalization_score < current_best_score:
-                    should_update = True
-            
-            if should_update:
-                # Store task-specific metrics
-                checkpoint_metrics = {
-                    "loss": eval_loss,
-                    "step": state.global_step,
-                    "generalization_score": generalization_score,
-                    "overfitting_penalty": overfitting_penalty
-                }
-                
-                # Add task-specific metrics
-                if self.task_type and "GrpoTask" in self.task_type:
-                    checkpoint_metrics["train_reward"] = train_metric if train_metric else None
-                    checkpoint_metrics["eval_reward"] = -eval_loss
-                else:
-                    checkpoint_metrics["train_loss"] = train_metric
-                    checkpoint_metrics["eval_loss"] = eval_loss
-                
-                print(f"DECISIVE: Updating best checkpoint at step {state.global_step} with generalization_score: {generalization_score:.6f} (eval_loss: {eval_loss:.6f})", flush=True)
-                self.best_checkpoint_info = checkpoint_metrics
-                self.update_best_checkpoint = True
-            
-            # DECISIVE: Track top 3 checkpoints for interpolation
-            checkpoint_entry = {
-                "step": state.global_step,
-                "eval_loss": eval_loss,
-                "generalization_score": generalization_score
+            self.best_composite_score = composite_score
+            self.best_checkpoint_info = {
+                "loss": eval_loss,
+                "composite_score": composite_score,
+                "step": state.global_step
             }
-            
-            # Add task-specific metrics to checkpoint entry
-            if self.task_type and "GrpoTask" in self.task_type:
-                checkpoint_entry["train_reward"] = train_metric
-                checkpoint_entry["eval_reward"] = -eval_loss
-            else:
-                checkpoint_entry["train_loss"] = train_metric
-                checkpoint_entry["eval_loss"] = eval_loss
+            self.update_best_checkpoint = True
+            self.steps_without_improvement = 0
+            self.last_improvement_step = state.global_step
             
             # Add to top checkpoints list
-            self.top_checkpoints.append(checkpoint_entry)
-            
-            # Keep only top 3 by generalization_score
-            self.top_checkpoints.sort(key=lambda x: x["generalization_score"])
+            self.top_checkpoints.append({
+                "step": state.global_step,
+                "eval_loss": eval_loss,
+                "composite_score": composite_score
+            })
+            # Keep only top N checkpoints, sorted by composite_score
+            self.top_checkpoints.sort(key=lambda x: x["composite_score"])
             if len(self.top_checkpoints) > self.max_top_checkpoints:
                 self.top_checkpoints = self.top_checkpoints[:self.max_top_checkpoints]
-            
-            top_ckpt_info = [(c['step'], f"gen_score={c['generalization_score']:.6f}") for c in self.top_checkpoints]
-            print(f"Top {len(self.top_checkpoints)} checkpoints: {top_ckpt_info}", flush=True)
-            
-            if not should_update and self.best_checkpoint_info is not None:
-                current_best_score = self.best_checkpoint_info.get("generalization_score", self.best_checkpoint_info["loss"])
-                print(f" At step: {state.global_step} The generalization_score: {generalization_score:.6f} is not better than current best: {current_best_score:.6f}, update_best_checkpoint={self.update_best_checkpoint}", flush=True)
+        else:
+            # Calculate steps since last improvement
+            self.steps_without_improvement = state.global_step - self.last_improvement_step
+            if self.best_checkpoint_info is not None:
+                print(f" At step: {state.global_step} - Eval Loss: {eval_loss:.6f}, Composite: {composite_score:.6f}", flush=True)
+                print(f"  Best so far: Step {self.best_checkpoint_info['step']}, Eval Loss: {self.best_checkpoint_info['loss']:.6f}, Composite: {self.best_checkpoint_info.get('composite_score', 'N/A'):.6f}", flush=True)
+                print(f"  Steps without improvement: {self.steps_without_improvement} (patience: {self.early_stopping_patience})", flush=True)
+        
+        # Early stopping based on validation loss plateau
+        if self.early_stopping_patience > 0 and self.steps_without_improvement >= self.early_stopping_patience and self.last_improvement_step > 0:
+            print(f"*** EARLY STOPPING triggered at step {state.global_step} ***", flush=True)
+            print(f"  No improvement for {self.steps_without_improvement} steps (patience: {self.early_stopping_patience})", flush=True)
+            control.should_training_stop = True
             
 
     def on_save(self, args, state: TrainerState, control: TrainerControl, **kwargs):
         
-        if self.max_steps != -1 and state.global_step >= self.max_steps:
+        if state.global_step == self.max_steps and self.max_steps != -1:
             print(f"Stop training because of max steps: {self.max_steps}", flush=True)
             control.should_training_stop = True
         
@@ -672,25 +317,7 @@ class CustomEvalSaveCallback(TrainerCallback):
             current_step = state.global_step
             # Remove existing directory if it exists
             if os.path.exists(self.submission_dir):
-                try:
-                    # Use ignore_errors=True to handle FileNotFoundError and other errors gracefully
-                    shutil.rmtree(self.submission_dir, ignore_errors=True)
-                except Exception as e:
-                    # Catch all exceptions to prevent crashes from file system issues
-                    # This handles FileNotFoundError, PermissionError, and other filesystem errors
-                    print(f"Warning: Error removing submission directory (ignoring): {e}", flush=True)
-                    # Try to continue even if removal failed
-                    try:
-                        # If rmtree failed, try to remove individual files that might be causing issues
-                        import stat
-                        def handle_remove_readonly(func, path, exc):
-                            if os.path.exists(path):
-                                os.chmod(path, stat.S_IWRITE)
-                                func(path)
-                        shutil.rmtree(self.submission_dir, onerror=handle_remove_readonly)
-                    except Exception:
-                        # If all else fails, just continue - the copytree will handle it
-                        pass
+                shutil.rmtree(self.submission_dir)
                 
             shutil.copytree(
                 os.path.join(self.output_dir, f"checkpoint-{current_step}"),
@@ -714,349 +341,23 @@ class CustomEvalSaveCallback(TrainerCallback):
             print(f"Copy the best checkpoint to the submission directory at step: {state.global_step}", flush=True)
             # Remove existing directory if it exists
             if os.path.exists(self.submission_dir):
-                try:
-                    # Use ignore_errors=True to handle FileNotFoundError and other errors gracefully
-                    shutil.rmtree(self.submission_dir, ignore_errors=True)
-                except Exception as e:
-                    # Catch all exceptions to prevent crashes from file system issues
-                    # This handles FileNotFoundError, PermissionError, and other filesystem errors
-                    print(f"Warning: Error removing submission directory (ignoring): {e}", flush=True)
-                    # Try to continue even if removal failed
-                    try:
-                        # If rmtree failed, try to remove individual files that might be causing issues
-                        import stat
-                        def handle_remove_readonly(func, path, exc):
-                            if os.path.exists(path):
-                                os.chmod(path, stat.S_IWRITE)
-                                func(path)
-                        shutil.rmtree(self.submission_dir, onerror=handle_remove_readonly)
-                    except Exception:
-                        # If all else fails, just continue - the copytree will handle it
-                        pass
-            
+                shutil.rmtree(self.submission_dir)
             best_eval_loss = self.best_checkpoint_info["loss"]
-            best_gen_score = self.best_checkpoint_info.get("generalization_score", best_eval_loss)
-            
-            # Interpolation is expensive CPU/file I/O work, so only do it when the job
-            # has enough wall-clock budget for the extra overhead.
-            interpolation_hours_budget = self.metadata.get("hours_to_complete")
-            # Enable interpolation for any job with at least 45 minutes of budget.
-            # Model soups (checkpoint averaging) lower test loss by ~1-3 % vs. any single
-            # checkpoint, and the extra I/O happens after training ends — zero training overhead.
-            allow_interpolation = (
-                interpolation_hours_budget is None or interpolation_hours_budget >= 0.75
+            best_composite_score = self.best_checkpoint_info.get("composite_score", best_eval_loss)
+            shutil.copytree(
+                os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
+                self.submission_dir
             )
-            use_interpolation = (
-                allow_interpolation
-                and self.task_type != "GrpoTask"
-                and len(self.top_checkpoints) >= 2
-                # Similarity gate (correct direction — top_checkpoints sorted ascending so
-                # index 0 = best/lowest score, index 1 = second best/higher score):
-                # Only average if the second checkpoint is at most 25 % worse than the best.
-                # i.e. second_score < best_score * 1.25
-                # (The previous expression had operands reversed, making it always True.)
-                and self.top_checkpoints[1]["generalization_score"] < self.top_checkpoints[0]["generalization_score"] * 1.25
-            )
-            
-            if use_interpolation:
-                num_ckpts = min(len(self.top_checkpoints), 3)  # Use up to 3 checkpoints
-                print(f"DECISIVE: Interpolating top {num_ckpts} checkpoints for better generalization", flush=True)
-                
-                # IMPROVED: Exponential weighting based on generalization_score differences
-                # Better checkpoints get exponentially higher weights
-                ckpts = self.top_checkpoints[:num_ckpts]
-                best_score = ckpts[0]["generalization_score"]
-                
-                # Calculate exponential weights: exp(-alpha * score_diff)
-                # alpha controls how quickly weights decay (higher = more emphasis on best)
-                alpha = 10.0  # Tuned for good balance
-                raw_weights = []
-                for ckpt in ckpts:
-                    score_diff = ckpt["generalization_score"] - best_score
-                    # Normalize: weight = exp(-alpha * normalized_score_diff)
-                    # Use relative difference to handle different loss scales
-                    # Add safeguard: if best_score is very small, use absolute difference with cap
-                    if best_score > 0.01:  # Use relative normalization if score is reasonable
-                        normalized_diff = score_diff / best_score
-                    else:
-                        # For very small scores, use absolute difference with cap to prevent extreme weights
-                        normalized_diff = min(score_diff, 1.0)  # Cap at 1.0 to prevent extreme weights
-                    weight = math.exp(-alpha * max(0, normalized_diff))
-                    raw_weights.append(weight)
-                
-                # Normalize weights to sum to 1
-                total_weight = sum(raw_weights)
-                if total_weight > 0:
-                    weights = [w / total_weight for w in raw_weights]
-                else:
-                    # Fallback to fixed weights if calculation fails
-                    if num_ckpts == 3:
-                        weights = [0.5, 0.3, 0.2]
-                    elif num_ckpts == 2:
-                        weights = [0.6, 0.4]
-                    else:
-                        weights = [1.0]
-                
-                for i, ckpt in enumerate(ckpts):
-                    print(f"  Checkpoint {i+1}: step={ckpt['step']}, gen_score={ckpt['generalization_score']:.6f}, eval_loss={ckpt['eval_loss']:.6f}, weight={weights[i]:.2f}", flush=True)
-                
-                try:
-                    # Load all checkpoints for interpolation
-                    ckpt_paths = [os.path.join(self.output_dir, f"checkpoint-{ckpt['step']}") for ckpt in ckpts]
-                    
-                    # Check if all checkpoints exist
-                    if all(os.path.exists(path) for path in ckpt_paths):
-                        # Load state dicts
-                        import glob
-                        try:
-                            from safetensors.torch import load_file, save_file
-                            has_safetensors = True
-                        except ImportError:
-                            has_safetensors = False
-                            print(f"  Warning: safetensors not available, using .bin files only", flush=True)
-                        
-                        # Find model files (could be .bin or .safetensors)
-                        ckpt1_path = ckpt_paths[0]
-                        ckpt1_files = glob.glob(os.path.join(ckpt1_path, "*.safetensors"))
-                        if not ckpt1_files:
-                            ckpt1_files = glob.glob(os.path.join(ckpt1_path, "*.bin"))
-                        
-                        if ckpt1_files:
-                            # Copy first checkpoint as base
-                            shutil.copytree(ckpt1_path, self.submission_dir)
-                            
-                            # Interpolate weights: blend all checkpoints
-                            weight_str = " + ".join([f"{w:.2f}*ckpt{i+1}" for i, w in enumerate(weights)])
-                            print(f"  Interpolating weights: {weight_str}", flush=True)
-                            
-                            for file_path in ckpt1_files:
-                                filename = os.path.basename(file_path)
-                                output_path = os.path.join(self.submission_dir, filename)
-                                
-                                # Load all checkpoint state dicts
-                                states = []
-                                for ckpt_path in ckpt_paths:
-                                    file_path_ckpt = os.path.join(ckpt_path, filename)
-                                    if os.path.exists(file_path_ckpt):
-                                        if filename.endswith(".safetensors") and has_safetensors:
-                                            states.append(load_file(file_path_ckpt))
-                                        else:
-                                            states.append(torch.load(file_path_ckpt, map_location="cpu"))
-                                
-                                if len(states) == len(weights):
-                                    # Interpolate: weighted sum of all checkpoints
-                                    interpolated = {}
-                                    for key in states[0].keys():
-                                        # Check if all states have this key with same shape
-                                        if all(key in state and state[key].shape == states[0][key].shape for state in states):
-                                            interpolated[key] = sum(weights[i] * states[i][key] for i in range(len(states)))
-                                        else:
-                                            interpolated[key] = states[0][key]  # Use first checkpoint if key missing
-                                    
-                                    # Save interpolated weights
-                                    if filename.endswith(".safetensors") and has_safetensors:
-                                        save_file(interpolated, output_path)
-                                    else:
-                                        torch.save(interpolated, output_path)
-                            
-                            print(f"  Successfully interpolated {num_ckpts} checkpoints", flush=True)
-                            step_info = ",".join([f"step{i+1}={ckpt['step']}" for i, ckpt in enumerate(ckpts)])
-                            weight_info = ",".join([f"w{i+1}={w:.2f}" for i, w in enumerate(weights)])
-                            interpolation_info = f"interpolated:{step_info},{weight_info}"
-                        else:
-                            # Fallback: just use best checkpoint
-                            print(f"  Warning: Could not find model files, using best checkpoint only", flush=True)
-                            shutil.copytree(
-                                os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
-                                self.submission_dir
-                            )
-                            interpolation_info = "single_best"
-                    else:
-                        # Fallback: just use best checkpoint
-                        print(f"  Warning: Checkpoints not found, using best checkpoint only", flush=True)
-                        shutil.copytree(
-                            os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
-                            self.submission_dir
-                        )
-                        interpolation_info = "single_best"
-                except Exception as e:
-                    # Fallback: just use best checkpoint if interpolation fails
-                    print(f"  Warning: Interpolation failed ({e}), using best checkpoint only", flush=True)
-                    if os.path.exists(self.submission_dir):
-                        try:
-                            # Use ignore_errors=True to handle FileNotFoundError and other errors gracefully
-                            shutil.rmtree(self.submission_dir, ignore_errors=True)
-                        except Exception as err:
-                            # Catch all exceptions to prevent crashes from file system issues
-                            print(f"Warning: Error removing submission directory (ignoring): {err}", flush=True)
-                            # Try to continue even if removal failed
-                            try:
-                                import stat
-                                def handle_remove_readonly(func, path, exc):
-                                    if os.path.exists(path):
-                                        os.chmod(path, stat.S_IWRITE)
-                                        func(path)
-                                shutil.rmtree(self.submission_dir, onerror=handle_remove_readonly)
-                            except Exception:
-                                # If all else fails, just continue
-                                pass
-                    shutil.copytree(
-                        os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
-                        self.submission_dir
-                    )
-                    interpolation_info = "single_best"
-            else:
-                # Use single best checkpoint (with generalization_score)
-                if not allow_interpolation:
-                    print("Skipping checkpoint interpolation to preserve limited training time", flush=True)
-                print(f"Using best checkpoint (generalization_score={best_gen_score:.6f}, eval_loss={best_eval_loss:.6f})", flush=True)
-                shutil.copytree(
-                    os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
-                    self.submission_dir
-                )
-                interpolation_info = "single_best"
-            
             self.update_best_checkpoint = False
-            # add a loss.txt file to the submission directory
+            # add a loss.txt file to the submission directory with both metrics
             with open(os.path.join(self.submission_dir, "loss.txt"), "w") as f:
-                f.write(f"{self.best_checkpoint_info['step']},{best_eval_loss},{best_gen_score},{interpolation_info}")
-    
-    def on_train_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
-        """
-        Called when training ends. Extract final metrics and update LR lookup table automatically.
-        """
-        if not is_main_process(LOCAL_RANK):
-            return
-        
-        # Only update if enabled and task_type is provided
-        if not self.update_lr_lookup or not self.task_type:
-            return
-        
-        # Extract final metrics from training state
-        final_eval_loss = None
-        final_train_loss = None
-        
-        # Try to get final eval_loss from log_history
-        if state.log_history:
-            # Look for the last evaluation entry
-            for log_entry in reversed(state.log_history):
-                if "eval_loss" in log_entry:
-                    final_eval_loss = log_entry["eval_loss"]
-                    break
-                # For GRPO, check eval_reward
-                if "eval_reward" in log_entry:
-                    final_eval_loss = -log_entry["eval_reward"]  # Convert reward to loss
-                    break
+                f.write(f"{self.best_checkpoint_info['step']},{best_eval_loss},{best_composite_score}")
             
-            # Get final train_loss
-            for log_entry in reversed(state.log_history):
-                if "loss" in log_entry and "eval_loss" not in log_entry:
-                    final_train_loss = log_entry["loss"]
-                    break
-        
-        # If we have best checkpoint info, use that for eval_loss (more reliable)
-        if self.best_checkpoint_info and "loss" in self.best_checkpoint_info:
-            if final_eval_loss is None:
-                final_eval_loss = self.best_checkpoint_info["loss"]
-        
-        # Get learning rate from training args
-        learning_rate = getattr(args, "learning_rate", None)
-        if learning_rate is None:
-            # Try to get from log_history
-            if state.log_history:
-                for log_entry in reversed(state.log_history):
-                    if "learning_rate" in log_entry:
-                        learning_rate = log_entry["learning_rate"]
-                        break
-        
-        # Skip update if we don't have essential information
-        if learning_rate is None:
-            print(f"  [LR Update] Skipping: No learning rate found", flush=True)
-            return
-        
-        if final_eval_loss is None and final_train_loss is None:
-            print(f"  [LR Update] Skipping: No loss metrics found", flush=True)
-            return
-        
-        # Map task type to lookup table format
-        task_type_map = {
-            "InstructTextTask": "instruct",
-            "ChatTask": "instruct",  # Chat uses same lookup as instruct
-            "DpoTask": "dpo",
-            "GrpoTask": "grpo",
-        }
-        
-        lookup_task_type = task_type_map.get(self.task_type)
-        if not lookup_task_type:
-            print(f"  [LR Update] Skipping: Unknown task type '{self.task_type}'", flush=True)
-            return
-        
-        # Prepare metadata
-        metadata = self.metadata.copy()
-        metadata.update({
-            "final_step": state.global_step,
-            "best_checkpoint_step": self.best_checkpoint_info.get("step") if self.best_checkpoint_info else None,
-            "total_steps": self.total_steps_all_epochs,
-        })
-        
-        # CRITICAL: Add batch_size and effective_batch_size for joint LR-batch optimization
-        if hasattr(args, "per_device_train_batch_size"):
-            metadata["batch_size"] = args.per_device_train_batch_size
-            # Calculate effective batch size (per_device * gpu_count * grad_accum)
-            gpu_count = getattr(args, "world_size", 1)
-            grad_accum = getattr(args, "gradient_accumulation_steps", 1)
-            metadata["effective_batch_size"] = args.per_device_train_batch_size * gpu_count * grad_accum
-        elif "batch_size" not in metadata:
-            # Fallback: try to get from metadata if already set
-            pass
-        
-        # Add learning_rate to metadata if not already present
-        if "learning_rate" not in metadata:
-            metadata["learning_rate"] = learning_rate
-        
-        # Update LR lookup table
-        try:
-            from lrs_lookup import update_lr_lookup
-            
-            updated = update_lr_lookup(
-                task_type=lookup_task_type,
-                model=self.original_model_name,
-                learning_rate=learning_rate,
-                eval_loss=final_eval_loss,
-                train_loss=final_train_loss,
-                metadata=metadata
-            )
-            
-            if updated:
-                print(f"  [LR Update] Successfully updated LR lookup table for {self.original_model_name[:50]}...", flush=True)
-                print(f"  [LR Update]   - LR: {learning_rate:.8f}", flush=True)
-            
-            # AutoML: Also update hyperparameter lookup table
-            try:
-                from hyperparam_optimizer import update_hyperparams
-                from model_utility import get_model_num_params
-                
-                param_nums = get_model_num_params(self.original_model_name, "")
-                update_hyperparams(
-                    task_type=lookup_task_type,
-                    model=self.original_model_name,
-                    param_nums=param_nums,
-                    eval_loss=final_eval_loss,
-                    train_loss=final_train_loss,
-                    metadata=metadata
-                )
-            except Exception as e:
-                print(f"  [AutoML] Warning: Could not update hyperparameter lookup: {e}", flush=True)
-                if final_eval_loss:
-                    print(f"  [LR Update]   - Eval Loss: {final_eval_loss:.6f}", flush=True)
-                if final_train_loss:
-                    print(f"  [LR Update]   - Train Loss: {final_train_loss:.6f}", flush=True)
-            else:
-                print(f"  [LR Update] Lookup table not updated (existing entry has better or equal loss)", flush=True)
-        except Exception as e:
-            print(f"  [LR Update] Error updating LR lookup table: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
+            # Log top checkpoints for reference
+            if self.top_checkpoints:
+                print(f"*** Top {len(self.top_checkpoints)} checkpoints by composite score:", flush=True)
+                for i, ckpt in enumerate(self.top_checkpoints, 1):
+                    print(f"  {i}. Step {ckpt['step']}: Eval Loss={ckpt['eval_loss']:.6f}, Composite={ckpt['composite_score']:.6f}", flush=True)
 
 
 class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
@@ -1073,72 +374,6 @@ class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
             eval_loss = - eval_loss
             
         return eval_loss
-    
-    def compute_generalization_score(self, eval_loss: float, state: TrainerState, metrics: Dict) -> tuple:
-        """
-        GRPO-specific generalization score using reward-based metrics.
-        For GRPO: overfitting = train_reward >> eval_reward
-        """
-        # Extract train reward from log_history
-        train_reward = None
-        if state.log_history:
-            # Look for train reward in log_history
-            for log_entry in reversed(state.log_history):
-                if "reward" in log_entry and "eval_reward" not in log_entry:
-                    train_reward = log_entry.get("reward", None)
-                    break
-                # Also check metrics directly
-                if "train_reward" in log_entry:
-                    train_reward = log_entry.get("train_reward", None)
-                    break
-        
-        # If not found in log_history, try metrics dict
-        if train_reward is None:
-            train_reward = metrics.get("train_reward", None)
-        
-        eval_reward = -eval_loss  # Convert back to reward space (eval_loss is negated reward)
-        generalization_score = eval_loss  # Start with eval_loss (lower is better)
-        overfitting_penalty = 0.0
-        
-        if train_reward is not None:
-            # For GRPO: overfitting when train_reward >> eval_reward
-            # In reward space: higher is better, so gap = train_reward - eval_reward
-            # In loss space: we want to penalize when train_reward >> eval_reward
-            reward_gap = max(0, train_reward - eval_reward)
-            
-            # Calculate gap ratio (in reward space for interpretability)
-            if eval_reward > 0:
-                reward_gap_ratio = train_reward / eval_reward
-            elif train_reward > 0:
-                # Eval reward is negative or zero, but train is positive = severe overfitting
-                reward_gap_ratio = float('inf')
-            else:
-                # Both negative or zero, use absolute difference
-                reward_gap_ratio = abs(train_reward - eval_reward) / max(abs(eval_reward), 0.01) if abs(eval_reward) > 0.01 else 1.0
-            
-            # Adaptive penalty for GRPO reward gap
-            # Penalize more when train_reward is much higher than eval_reward
-            if reward_gap_ratio >= 1.5:  # Train reward 50%+ higher
-                penalty_factor = 0.7  # Very strong penalty
-            elif reward_gap_ratio >= 1.3:  # Train reward 30%+ higher
-                penalty_factor = 0.5  # Strong penalty
-            elif reward_gap_ratio >= 1.15:  # Train reward 15%+ higher
-                penalty_factor = 0.35  # Moderate penalty
-            else:
-                penalty_factor = 0.2  # Light penalty
-            
-            # Convert reward gap to loss space for penalty calculation
-            # reward_gap in reward space, convert to loss space: loss_gap = -reward_gap
-            # But we want positive penalty, so use reward_gap directly scaled
-            overfitting_penalty = penalty_factor * reward_gap
-            generalization_score = eval_loss + overfitting_penalty
-            
-            print(f"  [GRPO] train_reward={train_reward:.6f}, eval_reward={eval_reward:.6f}, reward_gap={reward_gap:.6f}, reward_gap_ratio={reward_gap_ratio:.3f}, penalty_factor={penalty_factor:.2f}, overfitting_penalty={overfitting_penalty:.6f}", flush=True)
-        else:
-            # No train reward available, use eval_loss only
-            print(f"  [GRPO] No train_reward available, using eval_reward only", flush=True)
-        
-        return generalization_score, overfitting_penalty, train_reward, eval_reward
     
     def penalize_eval_loss(self, eval_loss: float):
         if eval_loss < 0:
@@ -1166,58 +401,11 @@ class WhenToEvalHandler:
         self.periodic_save_steps = periodic_save_steps
         self.steps_per_epoch = steps_per_epoch
         self.max_steps = max_steps
-        # FRESH: Time-aware adaptive training
-        self.time_aware_mode = "normal"  # normal, tight, ample
 
     def __call__(self, global_step: int) -> dict:
-        # FRESH: Time-aware adaptive training - adjust strategy based on remaining time
-        remaining_minutes = None
-        if self.end_time:
-            try:
-                end_time_obj = datetime.datetime.strptime(self.end_time, "%Y-%m-%d %H:%M:%S")
-                end_time_obj = end_time_obj.replace(tzinfo=timezone.utc)
-                now = datetime.datetime.now(timezone.utc)
-                remaining_minutes = (end_time_obj - now).total_seconds() / 60
-                
-                # Adjust mode based on remaining time
-                if remaining_minutes < 30:  # Less than 30 minutes
-                    self.time_aware_mode = "tight"
-                elif remaining_minutes > 120:  # More than 2 hours
-                    self.time_aware_mode = "ample"
-                else:
-                    self.time_aware_mode = "normal"
-            except:
-                pass
         
         if self.steps_per_epoch != -1 and global_step % self.steps_per_epoch == 0 and global_step > 1:
             return {"eval": True, "reason": "epoch"}
-        
-        # IMPROVED: Adaptive evaluation frequency - more frequent near end and when overfitting likely
-        # FRESH: Time-aware - adjust frequency based on remaining time
-        if self.max_steps != -1 and self.max_steps > 0:
-            progress = global_step / self.max_steps
-            
-            # IMPROVED: More frequent evaluation in later stages to catch best checkpoint
-            # In tight time mode, evaluate more frequently to catch best checkpoint quickly
-            if self.time_aware_mode == "tight":
-                if progress > 0.7:  # Last 30% of training
-                    if global_step % 25 == 0 and global_step > 1:  # Very frequent (improved from 30)
-                        return {"eval": True, "reason": "periodic_frequent_tight"}
-                elif progress > 0.5:  # Last 50% of training
-                    if global_step % 40 == 0 and global_step > 1:  # Improved from 50
-                        return {"eval": True, "reason": "periodic_frequent_tight"}
-            elif progress > 0.8:  # Last 20% of training
-                # Evaluate every 40 steps (improved from 50 - more frequent)
-                if global_step % 40 == 0 and global_step > 1:
-                    return {"eval": True, "reason": "periodic_frequent"}
-            elif progress > 0.6:  # Last 40% of training
-                # Evaluate every 80 steps (improved from 100 - more frequent)
-                if global_step % 80 == 0 and global_step > 1:
-                    return {"eval": True, "reason": "periodic_frequent"}
-            elif progress > 0.4:  # IMPROVED: Also evaluate more frequently in mid-training
-                # Evaluate every 150 steps (moderately frequent)
-                if global_step % 150 == 0 and global_step > 1:
-                    return {"eval": True, "reason": "periodic_mid"}
         
         if self.periodic_save_steps != -1 and global_step % self.periodic_save_steps == 0 and global_step > 1:
             return {"eval": True, "reason": "periodic"}
@@ -1229,7 +417,7 @@ class WhenToEvalHandler:
                 self.run_eval = True
                 return {"eval": True, "reason": "end_time"}
         
-        if self.max_steps != -1 and global_step >= self.max_steps:
+        if self.max_steps != -1 and global_step == self.max_steps:
             print(f"Stop training because of max steps: {self.max_steps}", flush=True)
             return {"eval": True, "reason": "max_step"}
 
@@ -1266,58 +454,3 @@ def init_wandb(train_request: Dict):
     if is_main_process(LOCAL_RANK):
         os.makedirs(train_request["wandb_log_dir"], exist_ok=True)
     return True
-
-
-class EarlyStoppingCallback(TrainerCallback):
-    def __init__(self, patience: int = 8, min_delta: float = 0.0001, hours_to_complete: float = None):
-        # Adaptive patience in evaluation-counts (one count = one on_evaluate call).
-        # Evaluation fires every ~40-150 steps, so patience=8 ≈ 320-1200 steps without improvement.
-        if hours_to_complete is not None and hours_to_complete > 0:
-            if hours_to_complete <= 0.75:  # Very short jobs (<45 min)
-                self.patience = 4
-            elif hours_to_complete <= 1.5:  # Short jobs
-                self.patience = 6
-            elif hours_to_complete <= 2.0:  # Medium jobs
-                self.patience = 8
-            else:  # Long jobs — use the provided patience value
-                self.patience = patience
-            print(f"Adaptive early stopping: patience={self.patience} evaluations for {hours_to_complete:.2f}h job", flush=True)
-        else:
-            self.patience = patience
-        self.min_delta = min_delta
-        self.best_loss = None
-        self.wait = 0
-        self.stopped_epoch = 0
-    
-    def on_evaluate(self, args, state, control, metrics, **kwargs):
-        # Try to get eval_loss first, then eval_reward (for GRPO)
-        eval_loss = metrics.get("eval_loss", None)
-        if eval_loss is None and state.log_history:
-            last_log_entry = state.log_history[-1]
-            eval_reward = last_log_entry.get("eval_reward", None)
-            if eval_reward is not None:
-                # For GRPO: negate reward to convert to loss (lower is better)
-                eval_loss = -eval_reward
-        
-        if eval_loss is None:
-            return control
-        
-        if self.best_loss is None:
-            self.best_loss = eval_loss
-            self.wait = 0
-        elif eval_loss < self.best_loss - self.min_delta:
-            # Significant improvement
-            prev_best = self.best_loss
-            self.best_loss = eval_loss
-            self.wait = 0
-            print(f"Early stopping: Improved eval_loss to {eval_loss:.6f} (prev best: {prev_best:.6f}), resetting patience counter", flush=True)
-        else:
-            # No improvement
-            self.wait += 1
-            print(f"Early stopping: No improvement for {self.wait}/{self.patience} evaluations. Best loss: {self.best_loss:.6f}, Current: {eval_loss:.6f}", flush=True)
-            if self.wait >= self.patience:
-                print(f"Early stopping triggered at step {state.global_step}. Best loss: {self.best_loss:.6f}. Stopping training to prevent overfitting.", flush=True)
-                control.should_training_stop = True
-                self.stopped_epoch = state.epoch
-        
-        return control

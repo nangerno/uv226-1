@@ -1,7 +1,4 @@
 from typing import Dict, Optional
-import os
-# Set CUDA memory allocation config before importing torch to reduce fragmentation
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import requests
 import json
 import random
@@ -13,7 +10,7 @@ import torch
 from transformers.trainer_utils import is_main_process
 from dataclasses import dataclass, field
 from transformers import Trainer
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb, EarlyStoppingCallback
+from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
 
 # from packing.packed_dataset import PackedDataset
 from transformers import (
@@ -21,6 +18,7 @@ from transformers import (
     TrainingArguments,
 )
 
+import os
 import datetime
 import shutil
 from huggingface_hub import HfApi
@@ -121,12 +119,6 @@ def load_lora_model(training_args: TrainingArguments, model_path: str, lora_args
             else None
         ),
     )
-    # FlashAttention2 needs the model initialized on GPU to avoid falling back / warnings.
-    if not training_args.disable_fa and torch.cuda.is_available():
-        try:
-            model = model.to(f"cuda:{LOCAL_RANK}")
-        except Exception as e:
-            log_info(f"Warning: failed to move LoRA base model to GPU early: {e}")
     # do not resize tokem embeddings in LOra --> will encounter size mismatch error in evaluation 
     # model.resize_token_embeddings(token_nums)
     # convert to lora
@@ -186,12 +178,6 @@ def load_model(training_args: TrainingArguments, model_path: str, token_nums: in
         torch_dtype=torch.bfloat16,
         attn_implementation=attn_implementation,
     )
-    # FlashAttention2 needs the model initialized on GPU to avoid falling back / warnings.
-    if (not training_args.disable_fa) and ("flash_attention" in str(attn_implementation)) and torch.cuda.is_available():
-        try:
-            model = model.to(f"cuda:{LOCAL_RANK}")
-        except Exception as e:
-            log_info(f"Warning: failed to move model to GPU early for FA2: {e}")
     # model.resize_token_embeddings(token_nums)
     return model
 
@@ -209,18 +195,12 @@ def main():
     (training_args, lora_args) = argument_parser.parse_args_into_dataclasses()
     train_info = json.load(open(training_args.request_path, "r"))
     train_request = train_info["train_request"]
-    min_steps_per_epoch = train_request.get(
-        "min_steps_per_epoch", train_request["min_steps"]
-    )
-    train_request["min_steps_per_epoch"] = min_steps_per_epoch
     # log_info(f"Training request: {train_request}", "start")
     task_id = train_request["task_id"]
 
     tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    # Ensure consistent padding side for causal LMs (matches validator)
-    tokenizer.padding_side = "left"  # Left padding for causal LMs
     
     # wandb_init_success = init_wandb(train_request)
     # if not wandb_init_success:
@@ -233,31 +213,6 @@ def main():
     max_length = get_max_length_config()
     if "max_length" in train_request:
         max_length = train_request["max_length"]
-
-    # OPTIMIZATION: More conservative batch-size cap for long sequence lengths to reduce OOM retries.
-    # This is much faster than crashing multiple times and halving repeatedly.
-    # Made more conservative based on log analysis showing repeated OOM errors.
-    if train_request.get("adjust_batch_size", True):
-        cap = None
-        if max_length >= 2048:
-            # Very long sequences: very conservative caps
-            cap = 6 if not training_args.use_lora else 12
-        elif max_length >= 1536:
-            # Long sequences: conservative caps
-            cap = 10 if not training_args.use_lora else 20
-        elif max_length >= 1024:
-            # Medium-long sequences: moderate caps
-            cap = 20 if not training_args.use_lora else 40
-        elif max_length >= 512:
-            # Medium sequences: slightly conservative caps
-            cap = 40 if not training_args.use_lora else 80
-        
-        if cap is not None and training_args.per_device_train_batch_size > cap:
-            log_info(
-                f"[Batch Size Cap] Capping per_device_train_batch_size from {training_args.per_device_train_batch_size} to {cap} "
-                f"(max_length={max_length}, use_lora={training_args.use_lora}) to avoid OOM"
-            )
-            training_args.per_device_train_batch_size = cap
 
     # we already tokenize the data and save it to train_tokenized.json and dev_tokenized.json
     train_ds = MyDataset(
@@ -281,15 +236,13 @@ def main():
         * training_args.gradient_accumulation_steps
         * training_args.world_size
     )  # number of steps in the original training
-    # This heuristic is per epoch and is used to decide packing/batch-size behavior.
-    if original_steps < min_steps_per_epoch:
+    # min_steps here is per epoch
+    if original_steps < train_request["min_steps"]:
         donot_pack = True
-        log_info(
-            f"original_steps: {original_steps} < min_steps_per_epoch: {min_steps_per_epoch}, do not pack the dataset"
-        )
+        log_info(f"original_steps: {original_steps} < min_steps: {train_request['min_steps']}, do not pack the dataset")
 
     min_data_size_num = (
-        min_steps_per_epoch
+        train_request["min_steps"]
         * training_args.per_device_train_batch_size
         * training_args.gradient_accumulation_steps
         * training_args.world_size
@@ -337,7 +290,7 @@ def main():
     max_batch_size_theory = len(train_ds) / (
         training_args.gradient_accumulation_steps
         * training_args.world_size
-        * min_steps_per_epoch
+        * train_request["min_steps"]
     )
     max_batch_size_theory = int(max_batch_size_theory)
     if max_batch_size_theory == 0:
@@ -384,9 +337,7 @@ def main():
     training_args.save_only_model = True  # only save the model, not the optimizer
     
     max_steps = train_request.get("max_steps", -1)
-    training_args.max_steps = max_steps if max_steps and max_steps > 0 else -1
-    log_info(f"min_steps_per_epoch: {min_steps_per_epoch}")
-    log_info(f"effective max_steps: {training_args.max_steps}")
+    log_info(f"max_steps: {max_steps}")
     
     start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     state = get_state()
@@ -412,38 +363,9 @@ def main():
     if checking_step >= total_steps_per_epoch:
         checking_step = total_steps_per_epoch - 2
     
-    # Get model architecture and params for metadata
-    model_architecture = None
-    model_params = None
-    try:
-        from model_utility import get_model_architecture, get_model_num_params
-        model_architecture = get_model_architecture(train_request["model_path"])
-        model_params = get_model_num_params(train_request["model_name"], train_request["model_path"])
-    except:
-        pass
-    
-    # Prepare metadata for LR lookup update
-    metadata = {
-        "batch_size": training_args.per_device_train_batch_size,
-        "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
-        "gpu_count": training_args.world_size,
-        "use_lora": lora_args.lora_r > 0 if hasattr(lora_args, 'lora_r') else False,
-        "lora_rank": getattr(lora_args, 'lora_r', None),
-        "max_length": train_request.get("max_length"),
-        "epochs": training_args.num_train_epochs,
-        "warmup_steps": training_args.warmup_steps,
-        "hours_to_complete": train_request.get("hours_to_complete"),
-        "architecture": model_architecture,
-        "model_params": model_params,
-        "reg_ratio": train_info.get("reg_ratio"),  # Get from train_info if available
-    }
-    
-    # Determine task type from train_request (populated by text_trainer.py via task_type field)
-    task_type = train_request.get("task_type", "InstructTextTask")
-    
     trainer = Trainer(
         model=model,
-        processing_class=tokenizer,  # Changed from tokenizer to processing_class (deprecated parameter)
+        tokenizer=tokenizer,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=dev_ds,
@@ -458,20 +380,15 @@ def main():
                 total_steps_all_epochs=total_steps_all_epochs,
                 end_time=train_request["end_time"],
                 checking_mode=train_request.get("checking_mode", "none"),
-                task_type=task_type,
-                update_lr_lookup=train_request.get("find_lk_lr", True),  # Use find_lk_lr flag to control updates
-                metadata=metadata
-            ),
-            EarlyStoppingCallback(patience=8, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
+                early_stopping_patience=train_request.get("early_stopping_patience", 250)
+            )
         ],
     )
 
     trainer.tokenizer = tokenizer
-    # Automatically resume from last checkpoint if one exists
-    last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    if last_checkpoint:
-        log_info(f"Resuming from checkpoint: {last_checkpoint}")
-    trainer.train(resume_from_checkpoint=last_checkpoint if last_checkpoint else None)
+    # last_checkpoint = get_last_checkpoint(training_args.output_dir)
+    # log_info(f"last_checkpoint: {last_checkpoint}")
+    trainer.train()
     
     if is_main_process(LOCAL_RANK):
         success_file = os.path.join(training_args.output_dir, "success.txt")

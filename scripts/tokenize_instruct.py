@@ -133,100 +133,15 @@ def _load_evaluation_dataset(
 
 
 
-def is_repetitive(text, threshold=0.5):
-    """Check if text is too repetitive"""
-    if not text or len(text) < 10:
-        return False
-    words = text.split()
-    if len(words) < 10:
-        return False
-    unique_words = len(set(words))
-    repetition_ratio = unique_words / len(words)
-    return repetition_ratio < threshold
-
-def has_low_information_content(text):
-    """Check if text has low information content (too many common words)"""
-    if not text:
-        return True
-    common_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should', 'could', 'may', 'might', 'must', 'can'}
-    words = text.lower().split()
-    if len(words) == 0:
-        return True
-    common_ratio = sum(1 for w in words if w in common_words) / len(words)
-    return common_ratio > 0.6  # More than 60% common words
-
-
-def remove_empty_output_items_fast(items: list):
-    """Fast filtering to keep tokenization prep overhead low."""
-    result = []
-    for item in items:
-        if "output" in item and not item["output"]:
-            continue
-        if "input" in item and "instruct" in item:
-            if not item["instruct"] and not item["input"]:
-                continue
-        if "output" in item and type(item["output"]) is not str:
-            continue
-
-        if (
-            "instruct" in item
-            and type(item["instruct"]) is not str
-            and item["instruct"] is not None
-        ):
-            continue
-        if (
-            "input" in item
-            and type(item["input"]) is not str
-            and item["input"] is not None
-        ):
-            continue
-
-        result.append(item)
-    return result
-
-
-def remove_empty_output_items_lite(items: list):
-    """
-    Lightweight quality filter: keeps overhead low while removing the most harmful junk.
-
-    - Drops empty/invalid rows (same as fast)
-    - Drops trivially-short outputs
-    - Drops exact duplicate samples (instruct+input+output)
-    """
-    result = []
-    seen = set()
-    for item in remove_empty_output_items_fast(items):
-        out = item.get("output", "")
-        if isinstance(out, str) and len(out.strip()) < 5:
-            continue
-
-        key = (
-            item.get("instruct", ""),
-            item.get("input", ""),
-            item.get("output", ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(item)
-    return result
-
-
 def remove_empty_output_items(items: list):
-    """Remove empty and low-quality output items with enhanced filtering"""
     result = []
-    filtered_count = 0
     for item in items:
-        # Basic filtering
         if "output" in item and not item["output"]:
-            filtered_count += 1
             continue
         if "input" in item and "instruct" in item:
             if not item["instruct"] and not item["input"]:
-                filtered_count += 1
                 continue
         if "output" in item and type(item["output"]) is not str:
-            filtered_count += 1
             continue
 
         if (
@@ -234,36 +149,14 @@ def remove_empty_output_items(items: list):
             and type(item["instruct"]) is not str
             and item["instruct"] is not None
         ):
-            filtered_count += 1
             continue
         if (
             "input" in item
             and type(item["input"]) is not str
             and item["input"] is not None
         ):
-            filtered_count += 1
             continue
-        
-        # Enhanced quality filtering
-        output = item.get("output", "")
-        if output:
-            # Filter very short outputs
-            if len(output) < 5:
-                filtered_count += 1
-                continue
-            # Filter repetitive outputs
-            if is_repetitive(output):
-                filtered_count += 1
-                continue
-            # Filter low information content
-            if has_low_information_content(output):
-                filtered_count += 1
-                continue
-        
         result.append(item)
-    
-    if filtered_count > 0:
-        print(f"Filtered out {filtered_count} low-quality items")
     return result
 
 
@@ -273,100 +166,6 @@ def replace_wrong_token_in_item(item: dict):
             item[key] = item[key].replace("[PAD]", "")
     return item
 
-
-def calculate_adaptive_dev_size(
-    dataset_size: int = None,
-    hours_to_complete: float = 0,
-    model_params: int = None,
-    avg_seq_length: int = 1024,
-    multi_run_enabled: bool = False
-) -> int:
-    # Step 1: Base size from dataset percentage (if dataset size known)
-    if dataset_size and dataset_size > 0:
-        # Use percentage-based approach with minimums
-        # Standard: 2-5% of dataset, minimum 100 samples for reliability
-        base_percentage = 0.03  # 3% default
-        
-        # Adjust percentage based on dataset size
-        if dataset_size < 1000:
-            base_percentage = 0.1  # 10% for tiny datasets
-        elif dataset_size < 10000:
-            base_percentage = 0.05  # 5% for small datasets
-        elif dataset_size < 100000:
-            base_percentage = 0.03  # 3% for medium datasets
-        elif dataset_size < 1000000:
-            base_percentage = 0.02  # 2% for large datasets
-        else:
-            base_percentage = 0.01  # 1% for very large datasets
-        
-        base_dev_size = max(100, int(dataset_size * base_percentage))
-    else:
-        # Fallback: use time-based fixed sizes (original logic)
-        if hours_to_complete > 0 and hours_to_complete <= 0.5:
-            base_dev_size = 50
-        elif hours_to_complete > 0 and hours_to_complete <= 1.0:
-            base_dev_size = 100
-        elif hours_to_complete > 0 and hours_to_complete <= 2.0:
-            base_dev_size = 150
-        else:
-            base_dev_size = 200
-    
-    # Step 2: Time constraint adjustment (reduce for very short jobs)
-    time_factor = 1.0
-    if hours_to_complete > 0:
-        if hours_to_complete <= 0.5:
-            time_factor = 0.5  # Reduce by 50% for very short jobs
-        elif hours_to_complete <= 0.75:
-            time_factor = 0.7  # Reduce by 30%
-        elif hours_to_complete <= 1.0:
-            time_factor = 0.85  # Reduce by 15%
-        elif hours_to_complete <= 2.0:
-            time_factor = 0.95  # Slight reduction
-        # else: time_factor = 1.0 (no reduction for long jobs)
-    
-    # Step 3: Model size adjustment (larger models need more eval data)
-    model_factor = 1.0
-    if model_params:
-        if model_params > 10_000_000_000:  # > 10B params
-            model_factor = 1.3  # 30% more for very large models
-        elif model_params > 1_000_000_000:  # 1-10B params
-            model_factor = 1.15  # 15% more for large models
-        elif model_params < 100_000_000:  # < 100M params
-            model_factor = 0.9  # 10% less for tiny models
-        # else: model_factor = 1.0 (no adjustment for medium models)
-    
-    # Step 4: Sequence length adjustment (longer sequences = more expensive eval)
-    seq_factor = 1.0
-    if avg_seq_length > 0:
-        if avg_seq_length > 2048:
-            seq_factor = 0.7  # Reduce by 30% for very long sequences
-        elif avg_seq_length > 1024:
-            seq_factor = 0.85  # Reduce by 15% for long sequences
-        elif avg_seq_length < 256:
-            seq_factor = 1.2  # Increase by 20% for short sequences (cheap eval)
-        # else: seq_factor = 1.0 (no adjustment for medium sequences)
-    
-    # Step 5: Multi-run mode adjustment (needs more reliable eval for LR selection)
-    multi_run_factor = 1.0
-    if multi_run_enabled:
-        multi_run_factor = 1.2  # 20% more for multi-run (better LR selection)
-    
-    # Calculate final dev size
-    dev_size = int(base_dev_size * time_factor * model_factor * seq_factor * multi_run_factor)
-    
-    # Ensure reasonable bounds
-    min_dev_size = 50  # Minimum for any meaningful evaluation
-    max_dev_size = 2000  # Maximum to avoid excessive eval overhead
-    
-    # For very large datasets, cap at percentage of dataset
-    if dataset_size and dataset_size > 0:
-        max_dev_size = min(max_dev_size, int(dataset_size * 0.05))  # Never more than 5%
-    
-    dev_size = max(min_dev_size, min(max_dev_size, dev_size))
-    
-    return dev_size
-
-
 def split_dataset(
     total_data_path: str,
     train_data_path: str,
@@ -375,54 +174,30 @@ def split_dataset(
     dev_size: int = 200,
     max_data_size: int = -1
 ):
-    """Split the dataset into train and dev with test distribution matching"""
+    """Split the dataset into train and dev"""
     # Load the dataset
     with open(total_data_path, "r") as file:
         data = json.load(file)
 
+    random.seed(seed)
+    random.shuffle(data)
     if max_data_size > 0:
         data = data[:max_data_size]
 
-    # Strategy: Use last N samples for dev set (test sets often from later data)
-    # This better matches test distribution than random split
-    # If dataset is small, use random split instead
-    if len(data) > dev_size * 2:
-        # Use last samples for dev (better matches test distribution)
-        dev_items = data[-dev_size:]
-        train_items = data[:-dev_size]
-        print(f"Using last {dev_size} samples for dev set (test distribution matching)")
-    else:
-        # Fallback to random split for small datasets
-        random.seed(seed)
-        random.shuffle(data)
-        dev_items = data[:dev_size]
-        train_items = data[dev_size:]
-        print(f"Using random split for dev set (dataset too small for distribution matching)")
+    # Split the dataset into train and dev
+    dev_items = data[:dev_size]
+    train_items = data[dev_size:]
     # Save the train and dev datasets
-    # Filtering mode:
-    # - QUALITY_FILTER_MODE=off|lite|full (preferred)
-    # - ENABLE_QUALITY_FILTER=1 (backward-compat, same as full)
-    mode = (os.getenv("QUALITY_FILTER_MODE", "") or "").strip().lower()
-    if not mode:
-        mode = "full" if os.getenv("ENABLE_QUALITY_FILTER", "0") == "1" else "lite"
-
-    if mode == "full":
-        filter_fn = remove_empty_output_items
-    elif mode == "off":
-        filter_fn = remove_empty_output_items_fast
-    else:
-        filter_fn = remove_empty_output_items_lite
-
     with open(train_data_path, "w") as file:
         before_len = len(train_items)
-        train_items = filter_fn(train_items)
+        train_items = remove_empty_output_items(train_items)
         after_len = len(train_items)
         print(f"Removed {before_len - after_len} empty output items from train_ds")
         json.dump(train_items, file, ensure_ascii=False)
 
     with open(dev_data_path, "w") as file:
         before_len = len(dev_items)
-        dev_items = filter_fn(dev_items)
+        dev_items = remove_empty_output_items(dev_items)
         after_len = len(dev_items)
         print(f"Removed {before_len - after_len} empty output items from dev_ds")
         json.dump(dev_items, file, ensure_ascii=False)
@@ -479,52 +254,10 @@ def main(training_request_path: str):
             f"Max data size is {max_data_size}, so we will only extract {max_data_size} samples randomly"
         )
 
-    # Improved adaptive dev split: considers dataset size, model size, sequence length, time, and multi-run mode
-    hours_to_complete = float(training_request["train_request"].get("hours_to_complete", 0) or 0)
-    dev_size = int(training_request["train_request"].get("dev_size", 0) or 0)
-    
-    if dev_size <= 0:
-        # First, get dataset size to make percentage-based decisions
-        try:
-            from model_utility import get_data_size
-            dataset_size = get_data_size(total_path)
-        except:
-            dataset_size = None
-        
-        # Get model info for model-size aware split
-        model_name = training_request["train_request"].get("model_name", "")
-        model_params = None
-        try:
-            from model_utility import get_model_num_params
-            model_path = training_request["train_request"].get("model_path", "")
-            if model_path:
-                model_params = get_model_num_params(model_name, model_path)
-        except:
-            pass
-        
-        # Get sequence length (affects eval cost)
-        max_length = training_request["train_request"].get("max_length", 1024)
-        avg_seq_length = max_length  # Use max_length as proxy for avg
-        
-        # Check if multi-run mode is enabled (needs more reliable eval)
-        checking_mode = training_request["train_request"].get("checking_mode", "none")
-        multi_run_enabled = checking_mode in ["first_time", "second_time"]
-        
-        # Calculate adaptive dev size
-        dev_size = calculate_adaptive_dev_size(
-            dataset_size=dataset_size,
-            hours_to_complete=hours_to_complete,
-            model_params=model_params,
-            avg_seq_length=avg_seq_length,
-            multi_run_enabled=multi_run_enabled
-        )
-        print(f"  [Dev Split] Adaptive dev size: {dev_size} (dataset_size={dataset_size}, hours={hours_to_complete:.2f}, model_params={model_params/1e9 if model_params else None:.2f}B, seq_len={avg_seq_length}, multi_run={multi_run_enabled})", flush=True)
-
     split_dataset(
         total_path,
         train_path,
         dev_path,
-        dev_size=dev_size,
         max_data_size=max_data_size,
     )
     
@@ -534,8 +267,6 @@ def main(training_request_path: str):
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    # Ensure consistent padding side for causal LMs (matches validator)
-    tokenizer.padding_side = "left"  # Left padding for causal LMs
     max_length = -1  # default value in test_axolot.yml
 
     if "max_length" in training_request["train_request"]:
@@ -543,22 +274,12 @@ def main(training_request_path: str):
 
     print(f"max_length={max_length}")
 
-    train_tok_path = f"datasets/train_tokenized_{task_id}.json"
-    dev_tok_path = f"datasets/dev_tokenized_{task_id}.json"
-    skip_if_exists = os.getenv("SKIP_TOKENIZE_IF_EXISTS", "1") == "1"
-    force_retokenize = bool(training_request["train_request"].get("force_retokenize", False))
-    if skip_if_exists and not force_retokenize and os.path.exists(train_tok_path) and os.path.exists(dev_tok_path):
-        print("Tokenized files already exist; skipping tokenization (SKIP_TOKENIZE_IF_EXISTS=1).", flush=True)
-        t2 = datetime.now()
-        print(f"Tokenization completed in {(t2 - t1).seconds} seconds")
-        return
-
     tokenize_dataset(
         tokenizer,
         train_path,
         training_request["train_request"]["dataset_type"],
         config_path,
-        train_tok_path,
+        f"datasets/train_tokenized_{task_id}.json",
         max_length=max_length,
     )
     
@@ -567,7 +288,7 @@ def main(training_request_path: str):
         dev_path,
         training_request["train_request"]["dataset_type"],
         config_path,
-        dev_tok_path,
+        f"datasets/dev_tokenized_{task_id}.json",
         max_length=max_length,
     )
 

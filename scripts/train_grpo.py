@@ -1,7 +1,4 @@
 from typing import Dict, Optional
-import os
-# Set CUDA memory allocation config before importing torch to reduce fragmentation
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import requests
 import json
 import random
@@ -14,15 +11,9 @@ from utility import log_info
 from transformers import AutoTokenizer, BitsAndBytesConfig
 import transformers
 import torch
-from transformers.trainer_utils import is_main_process, get_last_checkpoint
+from transformers.trainer_utils import is_main_process
 from dataclasses import dataclass, field
-from transformers import (
-    Trainer,
-    TrainingArguments,
-    TrainerCallback,
-    TrainerState,
-    TrainerControl,
-)
+from transformers import Trainer
 from trl import GRPOConfig, GRPOTrainer, ModelConfig
 from trl import get_kbit_device_map, get_peft_config, get_quantization_config
 from peft import (
@@ -34,19 +25,30 @@ from peft import (
     AutoPeftModelForCausalLM,
 )
 import traceback
+from transformers import TrainerCallback
 import argparse
 import math
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, GRPOCustomEvalSaveCallback, WhenToEvalHandler, init_wandb, EarlyStoppingCallback
+from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
 from transformers.modeling_utils import is_deepspeed_zero3_enabled
 import os
 import glob
+from transformers import (
+    Trainer,
+    TrainingArguments,
+    TrainerCallback,
+    TrainerState,
+    TrainerControl,
+)
+import os
 import datetime
 import shutil
 from huggingface_hub import HfApi
 from typing import Callable, Optional
 import bitsandbytes as bnb
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import yaml
 from tokenize_grpo import get_dataset
+from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 GRPO_DEFAULT_NUM_GENERATIONS = 2
@@ -315,10 +317,6 @@ def main():
 
     train_info = json.load(open(training_args.request_path, "r"))
     train_request = train_info["train_request"]
-    min_steps_per_epoch = train_request.get(
-        "min_steps_per_epoch", train_request["min_steps"]
-    )
-    train_request["min_steps_per_epoch"] = min_steps_per_epoch
     task_id = train_request["task_id"]
     
     # wandb_init_success = init_wandb(train_request)
@@ -335,8 +333,6 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    # Ensure consistent padding side for causal LMs (matches validator)
-    tokenizer.padding_side = "left"  # Left padding for causal LMs
 
     # max_length = get_max_length_config()
     # if "max_length" in train_request:
@@ -367,7 +363,7 @@ def main():
     max_batch_size_theory = len(train_ds) / (
         training_args.gradient_accumulation_steps
         * training_args.world_size
-        * min_steps_per_epoch
+        * train_request["min_steps"]
     )
     max_batch_size_theory = int(max_batch_size_theory)
     if max_batch_size_theory == 0:
@@ -452,48 +448,12 @@ def main():
     log_info(f"Truncate the train_ds and dev_ds time: {(t2 - t1).seconds} seconds")
 
     max_steps = train_request.get("max_steps", -1)
-    training_args.max_steps = max_steps if max_steps and max_steps > 0 else -1
-    log_info(f"min_steps_per_epoch: {min_steps_per_epoch}")
-    log_info(f"effective max_steps: {training_args.max_steps}")
-    
-    total_steps_all_epochs = total_steps_per_epoch * training_args.num_train_epochs
-    log_info(f"total_steps_per_epoch: {total_steps_per_epoch}; total_steps_all_epochs: {total_steps_all_epochs}")
-    
-    checking_step = train_request.get("checking_step", -1)
-    if checking_step >= total_steps_per_epoch:
-        checking_step = total_steps_per_epoch - 2
+    log_info(f"max_steps: {max_steps}")
 
     has_extra_column = STANDARD_GRPO_EXTRA_COLUMN in train_ds.column_names
 
     sample_data = dev_ds.to_list()[:10] if len(dev_ds) > 10 else None
     wrapped_reward_funcs = get_reward_funcs(train_request["dataset_type"], sample_data, has_extra_column)
-    
-    # Get model architecture and params for metadata
-    model_architecture = None
-    model_params = None
-    try:
-        from model_utility import get_model_architecture, get_model_num_params
-        model_architecture = get_model_architecture(train_request["model_path"])
-        model_params = get_model_num_params(train_request["model_name"], train_request["model_path"])
-    except:
-        pass
-    
-    # Prepare metadata for LR lookup update
-    metadata = {
-        "batch_size": training_args.per_device_train_batch_size,
-        "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
-        "gpu_count": training_args.world_size,
-        "use_lora": peft_config is not None,
-        "lora_rank": getattr(peft_config, 'r', None) if peft_config else None,
-        "max_length": train_request.get("max_length"),
-        "epochs": training_args.num_train_epochs,
-        "warmup_steps": training_args.warmup_steps,
-        "hours_to_complete": train_request.get("hours_to_complete"),
-        "use_vllm": train_request.get("use_vllm", False),
-        "architecture": model_architecture,
-        "model_params": model_params,
-        "reg_ratio": train_info.get("reg_ratio") if "reg_ratio" in train_info else None,
-    }
     
     trainer = GRPOTrainer(
         model=model,
@@ -504,29 +464,22 @@ def main():
         processing_class=tokenizer,
         peft_config=peft_config,
         callbacks=[
-            GRPOCustomEvalSaveCallback(
+            CustomEvalSaveCallback(
                 WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
                 train_request["submission_dir"],
                 training_args.output_dir,
                 train_request["model_name"],
                 max_steps,
-                checking_step=checking_step,
-                total_steps_all_epochs=total_steps_all_epochs,
+                checking_step=train_request.get("checking_step", 100),
+                total_steps_all_epochs=total_steps_per_epoch * training_args.num_train_epochs,
                 end_time=train_request["end_time"],
                 checking_mode=train_request.get("checking_mode", "none"),
-                task_type="GrpoTask",
-                update_lr_lookup=train_request.get("find_lk_lr", False),  # GRPO typically doesn't use lookup
-                metadata=metadata
-            ),
-            EarlyStoppingCallback(patience=8, min_delta=0.0001, hours_to_complete=train_request.get("hours_to_complete"))
+                early_stopping_patience=train_request.get("early_stopping_patience", 300)
+            )
         ],
     )
 
-    # Automatically resume from last checkpoint if one exists
-    last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    if last_checkpoint:
-        log_info(f"Resuming from checkpoint: {last_checkpoint}")
-    trainer.train(resume_from_checkpoint=last_checkpoint if last_checkpoint else None)
+    trainer.train()
     
     if is_main_process(LOCAL_RANK):
         with open(os.path.join(training_args.output_dir, "success.txt"), "w") as f:

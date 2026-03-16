@@ -30,4 +30,3 @@ pandas==2.2.3
 mpi4py
 astor==0.8.1
 RestrictedPython==8.0
-packaging<26

@@ -51,9 +51,6 @@ class MinerSubmission(BaseModel):
     repo: str
     model_hash: str | None = None
 
-    # Turn off protected namespace for model
-    model_config = ConfigDict(protected_namespaces=())
-
 
 class MinerTaskResult(BaseModel):
     hotkey: str

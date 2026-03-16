@@ -29,22 +29,6 @@ def split_dataset(total_data_path: str, train_data_path: str, dev_data_path: str
     
     random.seed(seed)
     random.shuffle(data)
-
-    # Lightweight quality filtering: drop empty prompts + exact duplicates.
-    filtered = []
-    seen = set()
-    for item in data:
-        prompt = item.get("prompt") or item.get("instruction") or item.get("instruct") or item.get("input")
-        if prompt is None:
-            continue
-        if isinstance(prompt, str) and len(prompt.strip()) == 0:
-            continue
-        k = json.dumps(item, sort_keys=True, ensure_ascii=False)
-        if k in seen:
-            continue
-        seen.add(k)
-        filtered.append(item)
-    data = filtered
     
     # Split the dataset into train and dev
     dev_items = data[:dev_size]
@@ -96,56 +80,7 @@ def main(training_request_path: str):
     task_id = training_request["train_request"]["task_id"]
     train_path = os.path.join("datasets", f"grpo_train_{task_id}.json")
     dev_path = os.path.join("datasets", f"grpo_dev_{task_id}.json")
-
-    # Improved adaptive dev split: considers dataset size, model size, sequence length, time, and multi-run mode
-    hours_to_complete = float(training_request["train_request"].get("hours_to_complete", 0) or 0)
-    dev_size = int(training_request["train_request"].get("dev_size", 0) or 0)
-    
-    if dev_size <= 0:
-        # Import the adaptive calculation function from tokenize_instruct
-        import sys
-        import os
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from tokenize_instruct import calculate_adaptive_dev_size
-        
-        # Get dataset size
-        dataset_size = None
-        try:
-            from model_utility import get_data_size
-            dataset_size = get_data_size(total_path)
-        except:
-            pass
-        
-        # Get model info
-        model_params = None
-        model_name = training_request["train_request"].get("model_name", "")
-        try:
-            from model_utility import get_model_num_params
-            model_path = training_request["train_request"].get("model_path", "")
-            if model_path:
-                model_params = get_model_num_params(model_name, model_path)
-        except:
-            pass
-        
-        # Get sequence length
-        max_length = training_request["train_request"].get("max_length", 1024)
-        avg_seq_length = max_length
-        
-        # Check multi-run mode (GRPO typically doesn't use multi-run, but check anyway)
-        checking_mode = training_request["train_request"].get("checking_mode", "none")
-        multi_run_enabled = checking_mode in ["first_time", "second_time"]
-        
-        # Calculate adaptive dev size
-        dev_size = calculate_adaptive_dev_size(
-            dataset_size=dataset_size,
-            hours_to_complete=hours_to_complete,
-            model_params=model_params,
-            avg_seq_length=avg_seq_length,
-            multi_run_enabled=multi_run_enabled
-        )
-        print(f"  [Dev Split] Adaptive dev size: {dev_size} (dataset_size={dataset_size}, hours={hours_to_complete:.2f}, model_params={model_params/1e9 if model_params else None:.2f}B, seq_len={avg_seq_length}, multi_run={multi_run_enabled})", flush=True)
-
-    split_dataset(total_path, train_path, dev_path, dev_size=dev_size)
+    split_dataset(total_path, train_path, dev_path)
     t2 = datetime.now()
     print(f"Tokenization completed in {(t2 - t1).seconds} seconds")
 

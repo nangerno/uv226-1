@@ -170,7 +170,7 @@ def contain_python_execution(dataset_type: dict) -> bool:
     return False
 
 
-def get_run_cmd(config: dict, gpu_nums: int, train_info: dict = None):
+def get_run_cmd(config: dict, gpu_nums: int):
     required_keys = [
         "epoch_num",
         "batch_size",
@@ -194,59 +194,37 @@ def get_run_cmd(config: dict, gpu_nums: int, train_info: dict = None):
     if run_type == "ds":
         start_cmd = f"deepspeed"
 
-    # Time-aware warmup steps
-    warmup_steps = 35  # Default
-    if train_info:
-        hours_to_complete = float(train_info.get("hours_to_complete", 0) or 0)
-        if hours_to_complete > 0:
-            if hours_to_complete <= 0.75:
-                warmup_steps = 10  # Very short warmup for very short jobs
-            elif hours_to_complete <= 1.5:
-                warmup_steps = 20  # Short warmup for short jobs
-    
     template = (
         start_cmd
-        + f""" train_grpo.py \
-    --request_path {{request_path}} \
+        + """ train_grpo.py \
+    --request_path {request_path} \
     --bf16 True \
     --report_to wandb \
     --output_dir /workspace/data/trained_model \
-    --num_train_epochs {{epoch_num}} \
-    --per_device_train_batch_size {{batch_size}} \
-    --per_device_eval_batch_size {{eval_batch_size}} \
-    --gradient_accumulation_steps {{gradient_accumulation_steps}} \
+    --num_train_epochs {epoch_num} \
+    --per_device_train_batch_size {batch_size} \
+    --per_device_eval_batch_size {eval_batch_size} \
+    --gradient_accumulation_steps {gradient_accumulation_steps} \
     --eval_accumulation_steps 1 \
-    --eval_strategy no \
+    --eval_strategy steps \
+    --eval_steps 100 \
     --save_strategy no \
     --logging_steps 5 \
-    --learning_rate {{learning_rate}} \
-    --weight_decay {{weight_decay}} \
-    --warmup_steps {warmup_steps} \
+    --learning_rate {learning_rate} \
+    --weight_decay 0. \
+    --warmup_steps 35 \
     --lr_scheduler_type cosine_with_min_lr \
-    --lr_scheduler_kwargs "{{\\"min_lr_rate\\": {{min_lr_rate}}}}" \
+    --lr_scheduler_kwargs "{\\"min_lr_rate\\": {min_lr_rate}}" \
     --tf32 True \
-    --gradient_checkpointing {{gradient_checkpointing}} \
-    --optim {{optimizer}} \
-    --use_liger {{use_liger}} --num_generations {{num_generations}} --vllm_mode colocate --vllm_gpu_memory_utilization {{vllm_gpu_memory_utilization}} \
-    --disable_fa {{disable_fa}}"""
+    --gradient_checkpointing {gradient_checkpointing} \
+    --optim {optimizer} \
+    --use_liger {use_liger} --num_generations {num_generations} --vllm_mode colocate --vllm_gpu_memory_utilization {vllm_gpu_memory_utilization} \
+    --disable_fa {disable_fa}"""
     )
 
     if config.get("use_lora", False):
-        # Time-aware LoRA rank: Higher rank for short jobs for faster adaptation
-        if train_info:
-            hours_to_complete = float(train_info.get("hours_to_complete", 0) or 0)
-            if hours_to_complete > 0 and hours_to_complete <= 0.75:
-                lora_r, lora_alpha = 256, 512  # Higher rank for very short jobs
-            elif hours_to_complete <= 1.5:
-                lora_r, lora_alpha = 192, 384  # Medium-high rank for short jobs
-            else:
-                lora_r, lora_alpha = 128, 256  # Standard rank for longer jobs
-            if hours_to_complete > 0 and hours_to_complete <= 1.5:
-                print(f"Time-aware LoRA: Using rank {lora_r} (alpha {lora_alpha}) for {hours_to_complete:.2f}h job", flush=True)
-        else:
-            lora_r, lora_alpha = 128, 256  # Default
         template += (
-            f" --use_peft --lora_r {lora_r} --lora_alpha {lora_alpha} --lora_target_modules all-linear"
+            " --use_peft --lora_r 128 --lora_alpha 256 --lora_target_modules all-linear"
         )
 
     if config.get("use_vllm", True):
@@ -282,7 +260,7 @@ def get_training_json(train_info: dict) -> dict:
         "epoch_num": 2,
         "batch_size": config["batch_size"],
         "learning_rate": config["lr"],
-        "min_lr_rate": 0.05,
+        "min_lr_rate": 0.25,
         "use_liger": get_use_liger(model_architecture),
         "optimizer": "paged_adamw_8bit",
         "use_lora": config.get("use_lora", False),
@@ -299,8 +277,6 @@ def get_training_json(train_info: dict) -> dict:
         "tensor_parallel": config.get("tensor_parallel", False),
         "use_4bit": config.get("use_4bit", False),
     }
-    # NOTE: weight_decay is computed AFTER all use_lora overrides (below) so it reads the
-    # final value of run_config["use_lora"], not the initial one from the config bucket.
 
     if model_name == "OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5":
         run_config["use_lora"] = True
@@ -308,46 +284,11 @@ def get_training_json(train_info: dict) -> dict:
     if "starcoder" in model_name.lower():
         run_config["batch_size"] = int(run_config["batch_size"] / 1.5)
 
-    # Time-aware optimizations for better results in limited time
-    hours_to_complete = float(train_info.get("hours_to_complete", 0) or 0)
-    if hours_to_complete > 0:
-        if hours_to_complete <= 0.75:  # Very short jobs
-            # Reduce gradient accumulation for faster updates
-            run_config["gradient_accumulation_steps"] = max(1, run_config["gradient_accumulation_steps"] // 2)
-            # Reduce epochs
-            run_config["epoch_num"] = 1
-            print(f"Time-aware optimization: Very short job ({hours_to_complete:.2f}h) - reduced grad_accum, 1 epoch", flush=True)
-        elif hours_to_complete <= 1.5:  # Short jobs
-            run_config["gradient_accumulation_steps"] = max(2, int(run_config["gradient_accumulation_steps"] * 0.75))
-            run_config["epoch_num"] = 1
-            print(f"Time-aware optimization: Short job ({hours_to_complete:.2f}h) - adjusted grad_accum, 1 epoch", flush=True)
-
     train_request = deepcopy(train_info)
     train_request["save_before_remaining_time"] = 3
     train_request["min_steps"] = 100
-    train_request["min_steps_per_epoch"] = train_request["min_steps"]
     train_request["adjust_batch_size"] = False
-    train_request["periodic_save_steps"] = 150  # finer checkpoint selection → lower test loss
-
-    # Adaptive checking_step: ~12 % of estimated total steps, clamped to [80, 400].
-    # Used by the multi-run LR race (first_time / second_time checking_mode).
-    dataset_size = None
-    try:
-        from model_utility import get_data_size
-        if train_info.get("request_path"):
-            dataset_size = get_data_size(train_info["request_path"])
-    except Exception:
-        pass
-    if dataset_size and dataset_size > 0:
-        bs  = run_config["batch_size"]
-        ga  = run_config["gradient_accumulation_steps"]
-        gn  = run_config["gpu_nums"]
-        ep  = run_config["epoch_num"]
-        est_steps = max(1, dataset_size * ep // (bs * ga * gn))
-        checking_step = max(80, min(400, int(est_steps * 0.12)))
-    else:
-        checking_step = 100
-    train_request["checking_step"] = checking_step
+    train_request["periodic_save_steps"] = 500
 
     if if_contain_slow_reward_function(train_info["dataset_type"]):
         train_request["save_before_remaining_time"] = 12
@@ -407,14 +348,8 @@ def get_training_json(train_info: dict) -> dict:
         else:
             print(f"Using lr from config: {run_config['learning_rate']}", flush=True)
 
-    base_lr = run_config["learning_rate"]
     run_config["learning_rate"] *= train_info["reg_ratio"]
-    print(f"Applied reg_ratio: {base_lr:.8f} * {train_info['reg_ratio']:.6f} = {run_config['learning_rate']:.8f}", flush=True)
 
-    # Weight decay: computed here so it reflects ALL previous use_lora mutations.
-    # Full fine-tuning: stronger L2 regularization; LoRA: lighter decay (few adapter params).
-    run_config["weight_decay"] = 0.01 if run_config["use_lora"] else 0.05
-
-    run_cmd = get_run_cmd(run_config, run_config["gpu_nums"], train_info)
+    run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
 
     return {"train_request": train_request, "run_cmd": run_cmd}
