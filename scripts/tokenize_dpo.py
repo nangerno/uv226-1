@@ -72,7 +72,8 @@ def split_dataset(total_data_path: str, train_data_path: str, dev_data_path: str
     # Split the dataset into train and dev
     dev_items = data[:dev_size]
     train_items = data[dev_size:]
-    # Save the train and dev datasets
+    # Save the train and dev datasets (ensure parent dir exists when run from script_dir)
+    os.makedirs(os.path.dirname(train_data_path), exist_ok=True)
     with open(train_data_path, 'w') as file:
         json.dump(train_items, file, ensure_ascii=False)
     

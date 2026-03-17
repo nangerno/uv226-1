@@ -51,6 +51,17 @@ from transformers.modeling_utils import is_deepspeed_zero3_enabled
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
 
+def _flash_attention_supported() -> bool:
+    """FlashAttention requires Ampere (SM 8.0) or newer GPU."""
+    try:
+        if not torch.cuda.is_available():
+            return False
+        cap = torch.cuda.get_device_capability()
+        return cap is not None and len(cap) >= 1 and cap[0] >= 8
+    except Exception:
+        return False
+
+
 @dataclass
 class TrainingArguments(DPOConfig):
     request_path: Optional[str] = field(default=None)
@@ -195,7 +206,13 @@ def main():
     if training_args.use_attn_implementation:
         attn_implementation = training_args.use_attn_implementation
         log_info(f"Using {attn_implementation} as the attention implementation")
-        
+    if attn_implementation != "eager" and not _flash_attention_supported():
+        log_info("FlashAttention only supports Ampere+ GPU; falling back to eager attention")
+        attn_implementation = "eager"
+        if getattr(training_args, "padding_free", False):
+            training_args.padding_free = False
+            log_info("Disabled padding_free (recommended only with flash_attention_2)")
+
     model_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=attn_implementation,
@@ -267,6 +284,8 @@ def main():
     
     start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     state = get_state()
+    if "train" not in state:
+        state["train"] = {}
     state["train"]["start_train_time"] = start_time
     if is_main_process(LOCAL_RANK):
         set_state(state)

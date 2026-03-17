@@ -157,7 +157,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --gradient_accumulation_steps {gradient_accumulation_steps} \
     --eval_accumulation_steps 1 \
     --eval_strategy steps \
-    --eval_steps 100 \
+    --eval_steps {eval_steps} \
     --save_strategy epoch \
     --logging_steps 5 \
     --learning_rate {learning_rate} \
@@ -275,12 +275,15 @@ def get_training_json(train_info: dict) -> dict:
             print(f"Using lr from config: {run_config['learning_rate']}", flush=True)
 
     run_config["learning_rate"] *= train_info["reg_ratio"]
+    checking_step = 70
+    # Eval at or before checking_step so run selection uses test (eval) loss
+    run_config["eval_steps"] = min(100, checking_step)
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
     train_request = deepcopy(train_info)
     train_request["save_before_remaining_time"] = 3
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
-    train_request["checking_step"] = 70
+    train_request["checking_step"] = checking_step
 
     if param_nums < 1_000_000_000:
         train_request["min_steps"] = max(

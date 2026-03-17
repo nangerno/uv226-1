@@ -110,7 +110,7 @@ for key in GRPO_CONFIG:
 
 
 def if_contain_slow_reward_function(dataset_type: dict) -> bool:
-    reward_functions = dataset_type["reward_functions"]
+    reward_functions = dataset_type.get("reward_functions", [])
     for reward_func in reward_functions:
         func_def = reward_func["reward_func"]
         keywords = [
@@ -161,7 +161,7 @@ def get_grpo_config(param_nums: int) -> dict:
 
 
 def contain_python_execution(dataset_type: dict) -> bool:
-    reward_functions = dataset_type["reward_functions"]
+    reward_functions = dataset_type.get("reward_functions", [])
     for reward_func in reward_functions:
         func_def = reward_func["reward_func"]
         keywords = ["sat_reward_function", "ded_reward_function", "abd_reward_function"]

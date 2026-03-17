@@ -45,7 +45,20 @@ import pathlib
 from transformers import AutoConfig
 import lr_utils
 
-def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
+
+def _tf32_supported() -> bool:
+    """True if CUDA is available and GPU is Ampere (8.x) or newer (tf32 supported)."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        cap = torch.cuda.get_device_capability()
+        return cap is not None and len(cap) >= 1 and cap[0] >= 8
+    except Exception:
+        return False
+
+
+def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None, cwd: str | None = None):
     # print(f"Running command: {cmd}", flush=True)
     with open(log_file_path, "w") as log_file:
         # Prepare environment variables
@@ -62,6 +75,7 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
             text=True,
             bufsize=1,
             env=process_env,
+            cwd=cwd,
         )
 
         # Stream output to both console and log file
@@ -78,17 +92,17 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
 
 
 def replace_args_in_cmd(cmd: str, arg_name: str, arg_value: str):
-    match = re.search(f"(?P<p>--{arg_name}(\s+)([^\s]+))(\s+)", cmd)
+    # Match --arg value optionally followed by space (so arg at end of cmd still matches)
+    match = re.search(rf"(?P<p>--{re.escape(arg_name)}(\s+)([^\s]+))(?=\s|$)", cmd)
     if match:
         left_index = match.start("p")
         right_index = match.end("p")
         return cmd[:left_index] + f" --{arg_name} {arg_value} " + cmd[right_index:]
-    else:
-        return None
+    return None
 
 
 def extract_value_from_cmd(cmd: str, arg_name: str):
-    match = re.search(f"(?P<p>--{arg_name}(\s+)(?P<value>[^\s]+))(\s+)", cmd)
+    match = re.search(rf"(?P<p>--{arg_name}(\s+)(?P<value>[^\s]+))(\s+)", cmd)
     if match:
         return match.group("value")
     else:
@@ -118,6 +132,9 @@ def is_openai_model(model_name: str) -> bool:
 OOM_ERROR = "torch.OutOfMemoryError: CUDA out of memory"
 VLLM_OOM_ERROR = "ValueError: No available memory for the cache blocks"
 
+PROBE_MAX_STEPS = 10  # longer probe so memory pattern is closer to full training
+PROBE_SAFETY_FACTOR = 0.75  # use 75% of probed batch for full run to avoid OOM later
+
 
 def get_error_type(log_path: str):
     with open(log_path, "r") as f:
@@ -138,6 +155,118 @@ def extract_output_dir(train_cmd: str) -> str:
         return None
 
 
+def _run_probe(
+    train_cmd: str,
+    batch_size: int,
+    probe_output_dir: str,
+    probe_request_path: str,
+    probe_log_path: str,
+    env_vars: dict,
+    cwd: str | None,
+) -> bool:
+    """Run one probe at the given batch size. Returns True if no OOM."""
+    cmd = replace_args_in_cmd(train_cmd, "per_device_train_batch_size", str(batch_size))
+    if cmd is None:
+        return False
+    cmd = replace_args_in_cmd(cmd, "output_dir", probe_output_dir)
+    if cmd is None:
+        return False
+    cmd = replace_args_in_cmd(cmd, "request_path", probe_request_path)
+    if cmd is None:
+        return False
+    if os.path.exists(probe_log_path):
+        with open(probe_log_path, "w") as f:
+            f.write("STARTING PROBE")
+    run_cmd_with_log(cmd, probe_log_path, env_vars=env_vars, cwd=cwd)
+    return get_error_type(probe_log_path) != OOM_ERROR
+
+
+def find_max_batch_size_through_probe(
+    train_cmd: str,
+    log_path: str,
+    cwd: str | None,
+    env_vars: dict,
+) -> int:
+    """
+    Run short training probes to find the largest batch size that does not OOM.
+    Prefers big batch: tries the config batch size first, then binary-search down if OOM.
+    """
+    output_dir = extract_value_from_cmd(train_cmd, "output_dir")
+    request_path = extract_value_from_cmd(train_cmd, "request_path")
+    initial_batch_size = extract_value_from_cmd(train_cmd, "per_device_train_batch_size")
+    if not output_dir or not request_path or not initial_batch_size:
+        return int(initial_batch_size) if initial_batch_size else 1
+    initial_batch_size = int(initial_batch_size)
+    if initial_batch_size <= 1:
+        return 1
+
+    request_dir = os.path.dirname(os.path.abspath(request_path))
+    probe_request_path = os.path.join(request_dir, "probe_request.json")
+    try:
+        with open(request_path, "r") as f:
+            request_data = json.load(f)
+    except Exception as e:
+        print(f"Probe: could not read request {request_path}: {e}", flush=True)
+        return 1
+
+    if "train_request" in request_data:
+        request_data["train_request"] = dict(request_data["train_request"])
+        request_data["train_request"]["max_steps"] = PROBE_MAX_STEPS
+    try:
+        with open(probe_request_path, "w") as f:
+            json.dump(request_data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"Probe: could not write {probe_request_path}: {e}", flush=True)
+        return 1
+
+    probe_output_dir = output_dir.rstrip("/") + "_probe"
+    probe_log_path = log_path + ".probe"
+
+    # Prefer big batch: try config size first; if it fits, use it (one probe).
+    print(
+        f"Probe: trying per_device_train_batch_size={initial_batch_size} (max_steps={PROBE_MAX_STEPS})",
+        flush=True,
+    )
+    if _run_probe(
+        train_cmd, initial_batch_size,
+        probe_output_dir, probe_request_path, probe_log_path,
+        env_vars, cwd,
+    ):
+        try:
+            os.remove(probe_request_path)
+        except OSError:
+            pass
+        print(
+            f"Probe: selected per_device_train_batch_size={initial_batch_size} (config size fits)",
+            flush=True,
+        )
+        return initial_batch_size
+
+    # Config size OOMs: binary search for the largest batch that fits in [1, initial_batch_size - 1].
+    low, high = 1, initial_batch_size - 1
+    while low < high:
+        mid = (low + high + 1) // 2
+        print(
+            f"Probe: trying per_device_train_batch_size={mid} (max_steps={PROBE_MAX_STEPS})",
+            flush=True,
+        )
+        if _run_probe(
+            train_cmd, mid,
+            probe_output_dir, probe_request_path, probe_log_path,
+            env_vars, cwd,
+        ):
+            low = mid
+        else:
+            high = mid - 1
+
+    try:
+        os.remove(probe_request_path)
+    except OSError:
+        pass
+    print(f"Probe: selected per_device_train_batch_size={low}", flush=True)
+    return low
+
+
 def run_training(
     train_cmd: str,
     log_path: str,
@@ -145,7 +274,51 @@ def run_training(
     retries: int,
     task_type: str,
     expected_repo_name: str,
+    cwd: str | None = None,
 ):
+    training_env_vars = {
+        "WANDB_MODE": "offline",
+        "WANDB_RUN_ID": f"{task_id}_{expected_repo_name}",
+        "WANDB_NAME": f"{task_id}_{expected_repo_name}",
+    }
+
+    # Probe phase: find max batch size by increasing until OOM (avoids wasting full runs on OOM)
+    initial_batch = extract_value_from_cmd(train_cmd, "per_device_train_batch_size")
+    if initial_batch and int(initial_batch) > 1:
+        best_batch = find_max_batch_size_through_probe(
+            train_cmd, log_path, cwd, training_env_vars
+        )
+        # Use safety margin so full run doesn't OOM (probe is short; memory can grow later)
+        safe_batch = max(1, int(best_batch * PROBE_SAFETY_FACTOR))
+        if safe_batch < best_batch:
+            print(
+                f"Probe passed at {best_batch}; using safe batch {safe_batch} ({int(PROBE_SAFETY_FACTOR*100)}% margin for full run)",
+                flush=True,
+            )
+        new_cmd = replace_args_in_cmd(
+            train_cmd, "per_device_train_batch_size", str(safe_batch)
+        )
+        if new_cmd is not None:
+            train_cmd = new_cmd
+        # When batch size is small, boost gradient accumulation so effective batch >= 8 (better quality)
+        if safe_batch <= 4:
+            ga = extract_value_from_cmd(train_cmd, "gradient_accumulation_steps")
+            current_ga = int(ga) if ga else 1
+            target_effective = 8
+            new_ga = max(current_ga, (target_effective + safe_batch - 1) // safe_batch)
+            if new_ga != current_ga:
+                ga_cmd = replace_args_in_cmd(train_cmd, "gradient_accumulation_steps", str(new_ga))
+                if ga_cmd is not None:
+                    train_cmd = ga_cmd
+                    print(
+                        f"Boosted gradient_accumulation_steps {current_ga} -> {new_ga} (effective batch >= {target_effective})",
+                        flush=True,
+                    )
+        print(
+            f"Starting full training with per_device_train_batch_size={safe_batch}",
+            flush=True,
+        )
+
     for i in range(retries):
         print(
             f"************* Training attempt {i+1}/{retries} for task {task_id}*************",
@@ -176,27 +349,28 @@ def run_training(
                         print(f"batch size is 1, cannot reduce further", flush=True)
                         if task_type == TaskType.GRPOTASK.value:
                             # disable vllm
-                            train_cmd = replace_args_in_cmd(
+                            new_cmd = replace_args_in_cmd(
                                 train_cmd, "use_vllm", "False"
                             )
+                            if new_cmd is not None:
+                                train_cmd = new_cmd
                             # print(f"disable VLLM {train_cmd}", flush=True)
                 elif error_type == VLLM_OOM_ERROR:
                     if task_type == TaskType.GRPOTASK.value:
                         print(f"VLLM OOM error, disable VLLM", flush=True)
-                        train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
+                        new_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
+                        if new_cmd is not None:
+                            train_cmd = new_cmd
 
         # empty the log file if it exists
         if os.path.exists(log_path):
             with open(log_path, "w") as f:
                 f.write("STARTING TRAINING")
 
-        training_env_vars = {
-            "WANDB_MODE": "offline",
-            "WANDB_RUN_ID": f"{task_id}_{expected_repo_name}",
-            "WANDB_NAME": f"{task_id}_{expected_repo_name}",
-        }
-
-        run_cmd_with_log(train_cmd, log_path, env_vars=training_env_vars)
+        if not train_cmd:
+            print("train_cmd is empty or None, skipping run", flush=True)
+            return False
+        run_cmd_with_log(train_cmd, log_path, env_vars=training_env_vars, cwd=cwd)
         # check if training is successfully here so we can break the loop; if output_dir contains file: "successs.txt" return true
         output_dir = extract_value_from_cmd(train_cmd, "output_dir")
         if os.path.exists(os.path.join(output_dir, "success.txt")):
@@ -312,9 +486,9 @@ def main():
     except Exception as e:
         sys.exit(f"Error creating dataset type object: {e}")
 
-    dataset_path = train_paths.get_text_dataset_path(args.task_id)
+    repo_name = args.expected_repo_name or args.task_id
     submission_dir = train_paths.get_checkpoints_output_path(
-        args.task_id, args.expected_repo_name
+        args.task_id, repo_name
     )
     print(f"submission_dir: {submission_dir}", flush=True)
     if not os.path.exists(submission_dir):
@@ -329,10 +503,23 @@ def main():
     end_time = end_time.strftime("%Y-%m-%d %H:%M:%S")
     print("end_time: ", end_time, flush=True)
 
-    ds_folder = "datasets"
+    ds_folder = os.path.join(project_root, "datasets")
     os.makedirs(ds_folder, exist_ok=True)
     request_path = os.path.join(ds_folder, f"training_request_{args.task_id}.json")
+    # Use local dataset path; download from URL if args.dataset is a URL (e.g. when running outside Docker)
+    if args.dataset.strip().lower().startswith(("http://", "https://")):
+        dataset_path = os.path.join(ds_folder, f"{args.task_id}_train_data.json")
+        if not os.path.isfile(dataset_path):
+            import urllib.request
+            print(f"Downloading dataset from {args.dataset[:80]}...", flush=True)
+            urllib.request.urlretrieve(args.dataset, dataset_path)
+            print(f"Saved to {dataset_path}", flush=True)
+    else:
+        dataset_path = train_paths.get_text_dataset_path(args.task_id)
     model_path = str(train_paths.get_text_base_model_path(original_model_name))
+    # Use hub model id when cache path does not exist (e.g. local run without Docker)
+    if not os.path.isdir(model_path):
+        model_path = original_model_name
 
     is_openai = False
     if is_openai_model(original_model_name):
@@ -358,7 +545,7 @@ def main():
         "task_id": args.task_id,
         "dataset": dataset_path,
         "hours_to_complete": args.hours_to_complete,
-        "expected_repo_name": args.expected_repo_name,
+        "expected_repo_name": repo_name,
         "end_time": end_time,
         "dataset_type": dataset_type_dict,
         "submission_dir": submission_dir,
@@ -381,18 +568,18 @@ def main():
     ):
         train_info = get_instruct_training_json(train_info)
         tokenize_cmd = (
-            f"/workspace/axo_py/bin/python tokenize_instruct.py {request_path}"
+            f"{sys.executable} {os.path.join(script_dir, 'tokenize_instruct.py')} {request_path}"
         )
         train_cmd = train_info["run_cmd"]
 
     elif args.task_type == TaskType.DPOTASK.value:
         train_info = get_dpo_training_json(train_info)
-        tokenize_cmd = f"python tokenize_dpo.py {request_path}"
+        tokenize_cmd = f"{sys.executable} {os.path.join(script_dir, 'tokenize_dpo.py')} {request_path}"
         train_cmd = train_info["run_cmd"]
 
     elif args.task_type == TaskType.GRPOTASK.value:
         train_info = get_grpo_training_json(train_info)
-        tokenize_cmd = f"python tokenize_grpo.py {request_path}"
+        tokenize_cmd = f"{sys.executable} {os.path.join(script_dir, 'tokenize_grpo.py')} {request_path}"
         train_cmd = train_info["run_cmd"]
     else:
         raise ValueError(f"Task type {args.task_type} not supported")
@@ -402,10 +589,12 @@ def main():
         json.dump(train_info, f, indent=4, ensure_ascii=False)
 
     run_cmd_with_log(
-        tokenize_cmd, os.path.join(ds_folder, f"tokenize_{args.task_id}.log")
+        tokenize_cmd, os.path.join(ds_folder, f"tokenize_{args.task_id}.log"), cwd=script_dir
     )
 
     original_train_cmd = train_cmd
+    if not _tf32_supported():
+        original_train_cmd = original_train_cmd.replace("--tf32 True", "--tf32 False")
     train_success = False
     state = get_state()
     state = {}
@@ -448,7 +637,7 @@ def main():
                     # first find from runs the best loss
                     c_train_info["train_request"]["checking_mode"] = "none"
                     index = np.argmin([run["current_loss"] for run in state["runs"]])
-                    print(f"BL;{index};{state['runs'][index]['current_loss']}; {state['lrs'][index]}", flush=True)
+                    print(f"Best run by eval (test) loss; index={index}; eval_loss={state['runs'][index]['current_loss']}; lr={state['lrs'][index]}", flush=True)
                     train_cmd = state["runs"][index]["train_cmd"]  #replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
                     final_output_dir = state["runs"][index]["output_dir"]
                     state["mode"] = "finish"
@@ -485,27 +674,30 @@ def main():
                 args.task_id,
                 args.retries,
                 args.task_type,
-                args.expected_repo_name,
+                repo_name,
+                cwd=script_dir,
             )
+            train_success = success
             time.sleep(5)
             if not success:
                 print(f"Training failed for task {args.task_id} at count={count}", flush=True)
-                break 
-        
+                break
         count += 1
 
-    if not os.path.exists(submission_dir) or len(os.listdir(submission_dir)) < 2:
-        print(f"Training failed for task {args.task_id}", flush=True)
-    else:
+    # Only report success if we didn't break due to run failure and submission has expected outputs
+    if train_success and os.path.exists(submission_dir) and len(os.listdir(submission_dir)) >= 2:
         print(f"Training successfully done for task {args.task_id}", flush=True)
-        train_success = True
+    elif not train_success or not os.path.exists(submission_dir) or len(os.listdir(submission_dir)) < 2:
+        if train_success:
+            print(f"Training failed for task {args.task_id}", flush=True)
+        train_success = False
 
     if not train_success:
         print(f"Training failed for task {args.task_id}", flush=True)
         # add noise to the model
-        add_noise_cmd = f"python add_random_noise.py {model_path} {submission_dir}"
+        add_noise_cmd = f"{sys.executable} {os.path.join(script_dir, 'add_random_noise.py')} {model_path} {submission_dir}"
         run_cmd_with_log(
-            add_noise_cmd, os.path.join(ds_folder, f"add_noise_{args.task_id}.log")
+            add_noise_cmd, os.path.join(ds_folder, f"add_noise_{args.task_id}.log"), cwd=script_dir
         )
 
     patch_wandb_symlinks(train_cst.WANDB_LOGS_DIR)

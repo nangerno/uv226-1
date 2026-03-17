@@ -111,17 +111,18 @@ def get_model_num_params(model_id: str, model_path: str) -> int:
         raise Exception(f"Cannot get model size from {model_path}")
 
     except Exception as e:
-        print(f"Error getting model size from safetensors: {e}")
         try:
             model_size = re.search(r"(\d+)(?=[bB])", model_id)
             model_size = (
                 int(model_size.group(1)) * 1_000_000_000 if model_size else None
             )
-            print(f"Model size from regex: {model_size}")
-            return model_size
-        except Exception as e:
-            print(f"Error getting model size from regex: {e}")
-            return None
+            if model_size is not None:
+                print(f"Model size from regex: {model_size}")
+                return model_size
+        except Exception as regex_e:
+            pass
+        print(f"Error getting model size from safetensors: {e}")
+        return None
 
 
 def disable_flash_attention(architecture: str, model: str) -> str:

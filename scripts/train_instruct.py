@@ -31,6 +31,17 @@ from state_manager import get_state, set_state
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
 
+def _flash_attention_supported() -> bool:
+    """FlashAttention requires Ampere (SM 8.0) or newer GPU."""
+    try:
+        if not torch.cuda.is_available():
+            return False
+        cap = torch.cuda.get_device_capability()
+        return cap is not None and len(cap) >= 1 and cap[0] >= 8
+    except Exception:
+        return False
+
+
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     request_path: Optional[str] = field(default=None)
@@ -103,16 +114,19 @@ def load_lora_model(training_args: TrainingArguments, model_path: str, lora_args
     else:
         model_class = transformers.AutoModelForCausalLM
 
+    _attn = "flash_attention_2" if not training_args.disable_fa else "eager"
+    if _attn == "flash_attention_2" and not _flash_attention_supported():
+        _attn = "eager"
     model = model_class.from_pretrained(
         model_path,
-        attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager",
+        attn_implementation=_attn,
         torch_dtype=torch.bfloat16,
         quantization_config=(
             BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
-                attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager",
+                attn_implementation=_attn,
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
             if lora_args.q_lora
@@ -166,12 +180,15 @@ def load_model(training_args: TrainingArguments, model_path: str, token_nums: in
         log_info("---------------using LIGER------------")
         model_class = AutoLigerKernelForCausalLM
     
-    attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager"
+    attn_implementation = "flash_attention_2" if not training_args.disable_fa else "eager"
     if training_args.use_attn_implementation:
         attn_implementation = training_args.use_attn_implementation
         log_info(f"Using {attn_implementation} as the attention implementation")
+    if attn_implementation == "flash_attention_2" and not _flash_attention_supported():
+        log_info("FlashAttention requires Ampere+ GPU; falling back to eager attention")
+        attn_implementation = "eager"
     log_info(f"Using attn_implementation: {attn_implementation}")
-    
+
     model = model_class.from_pretrained(
         model_path,
         # trust_remote_code=True, remove this because we already filter the model architecture, it will not be used with liger-kernel 
@@ -197,8 +214,16 @@ def main():
     train_request = train_info["train_request"]
     # log_info(f"Training request: {train_request}", "start")
     task_id = train_request["task_id"]
+    request_dir = os.path.dirname(os.path.abspath(training_args.request_path))
 
-    tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
+    model_path = train_request["model_path"]
+    model_name = train_request.get("model_name", model_path)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Use hub model name when local path does not exist (e.g. local dev without /cache)
+    effective_model_path = model_path if os.path.isdir(model_path) else model_name
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
@@ -217,13 +242,13 @@ def main():
     # we already tokenize the data and save it to train_tokenized.json and dev_tokenized.json
     train_ds = MyDataset(
         tokenizer,
-       f"datasets/train_tokenized_{task_id}.json",
+        os.path.join(request_dir, f"train_tokenized_{task_id}.json"),
         max_length
     )
 
     dev_ds = MyDataset(
         tokenizer,
-        f"datasets/dev_tokenized_{task_id}.json",
+        os.path.join(request_dir, f"dev_tokenized_{task_id}.json"),
         max_length
     )
     log_info(f"train_size: {len(train_ds)}; dev_size: {len(dev_ds)}")
@@ -254,7 +279,7 @@ def main():
         from monkeypatch import monkey_patch_packing_for_model, PackedDataset
         log_info("Patching packing for model")
 
-        monkey_patch_packing_for_model(train_request["model_path"])
+        monkey_patch_packing_for_model(effective_model_path)
         t1 = datetime.datetime.now()
         train_ds = PackedDataset(
             train_ds,
@@ -313,9 +338,9 @@ def main():
             log_info(f"updated total_steps_per_epoch: {total_steps_per_epoch}")
 
     if training_args.use_lora:
-        model = load_lora_model(training_args, train_request["model_path"], lora_args, len(tokenizer))
+        model = load_lora_model(training_args, effective_model_path, lora_args, len(tokenizer))
     else:
-        model = load_model(training_args, train_request["model_path"], len(tokenizer))
+        model = load_model(training_args, effective_model_path, len(tokenizer))
         # some model need to resize the token embeddings or encounter the size mismatch error; only for full-weight models
         resize_if_needed(train_request["model_name"], model, len(tokenizer))
     
@@ -341,6 +366,8 @@ def main():
     
     start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     state = get_state()
+    if "train" not in state:
+        state["train"] = {}
     state["train"]["start_train_time"] = start_time
     if is_main_process(LOCAL_RANK):
         set_state(state)
@@ -365,7 +392,6 @@ def main():
     
     trainer = Trainer(
         model=model,
-        tokenizer=tokenizer,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=dev_ds,

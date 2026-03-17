@@ -57,6 +57,17 @@ STANDARD_GRPO_EXTRA_COLUMN = "extra_data"
 STANDARD_GRPO_PROMPT_COLUMN = "prompt"
 
 
+def _flash_attention_supported() -> bool:
+    """FlashAttention requires Ampere (SM 8.0) or newer GPU."""
+    try:
+        if not torch.cuda.is_available():
+            return False
+        cap = torch.cuda.get_device_capability()
+        return cap is not None and len(cap) >= 1 and cap[0] >= 8
+    except Exception:
+        return False
+
+
 @dataclass
 class TrainingArguments(GRPOConfig):
     request_path: Optional[str] = field(default=None)
@@ -250,12 +261,20 @@ def get_reward_funcs(dataset_type: dict, sample_data, has_extra_column: bool):
     reward_func_names = []
     reward_weights = []
 
-    reward_weights_list = [
-        rf["reward_weight"] for rf in dataset_type["reward_functions"]
-    ]
+    reward_functions = dataset_type.get("reward_functions", [])
+    if not reward_functions:
+        reward_functions = [
+            {
+                "reward_func": "def reward(completions):\n    return [1.0] * len(completions)",
+                "reward_weight": 1.0,
+            }
+        ]
+        log_info("dataset_type has no reward_functions; using default neutral reward (constant 1.0)")
+
+    reward_weights_list = [rf["reward_weight"] for rf in reward_functions]
     print(f"Using weights directly: {reward_weights_list}")
 
-    for i, reward_function in enumerate(dataset_type["reward_functions"]):
+    for i, reward_function in enumerate(reward_functions):
         reward_func_str = reward_function["reward_func"]
         is_valid, error_msg, reward_func_callable = validate_reward_function(
             reward_func_str, sample_data
@@ -267,7 +286,7 @@ def get_reward_funcs(dataset_type: dict, sample_data, has_extra_column: bool):
         reward_weight = reward_weights_list[i]
         reward_funcs_callable.append(reward_func_callable)
 
-        func_name = getattr(reward_function, "name", f"reward_func_{i}")
+        func_name = reward_function.get("name", f"reward_func_{i}") if isinstance(reward_function, dict) else getattr(reward_function, "name", f"reward_func_{i}")
         weighted_name = f"{func_name}_weight_{reward_weight:.2f}"
         reward_func_names.append(weighted_name)
         reward_weights.append(reward_weight)
@@ -380,12 +399,15 @@ def main():
     )
     if len(training_args.fsdp) > 0 or is_deepspeed_zero3_enabled():
         device_map = None
-    
+
+    attn_implementation = "flash_attention_2" if not training_args.disable_fa else "eager"
+    if attn_implementation == "flash_attention_2" and not _flash_attention_supported():
+        log_info("FlashAttention only supports Ampere+ GPU; falling back to eager attention")
+        attn_implementation = "eager"
+
     model_kwargs = dict(
         revision=model_args.model_revision,
-        attn_implementation=(
-            "flash_attention_2" if not training_args.disable_fa else "eager"
-        ),
+        attn_implementation=attn_implementation,
         torch_dtype=torch.bfloat16,
         use_cache=False if training_args.gradient_checkpointing else True,
         device_map=device_map,
@@ -454,7 +476,25 @@ def main():
 
     sample_data = dev_ds.to_list()[:10] if len(dev_ds) > 10 else None
     wrapped_reward_funcs = get_reward_funcs(train_request["dataset_type"], sample_data, has_extra_column)
-    
+
+    if getattr(training_args, "use_vllm", False):
+        try:
+            import vllm  # noqa: F401
+        except ImportError:
+            log_info("vLLM is not installed; setting use_vllm=False (install with: pip install trl[vllm] for vLLM-backed generation)")
+            training_args.use_vllm = False
+
+    # Without vLLM, generation uses more GPU memory (eager attention); reduce batch and length to avoid OOM
+    if not getattr(training_args, "use_vllm", True):
+        gen_batch = getattr(training_args, "generation_batch_size", None)
+        if gen_batch is not None and int(gen_batch) > 1:
+            training_args.generation_batch_size = 1
+            log_info(f"Without vLLM, reduced generation_batch_size to 1 to avoid OOM (was {gen_batch})")
+        max_comp = getattr(training_args, "max_completion_length", None)
+        if max_comp is not None and int(max_comp) > 128:
+            training_args.max_completion_length = 128
+            log_info(f"Without vLLM, reduced max_completion_length to 128 to avoid OOM (was {max_comp})")
+
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=wrapped_reward_funcs,

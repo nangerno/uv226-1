@@ -5,7 +5,7 @@ from torch.utils.data import Dataset
 from pathlib import Path
 from transformers import AutoTokenizer
 from typing import Callable
-from axolotl.utils.data import load_tokenized_prepared_datasets
+from datasets import load_from_disk
 import torch
 import logging
 from datetime import datetime
@@ -109,13 +109,64 @@ def load_and_update_evaluation_config(
     return DictDefault(config_dict)
 
 
+def _tokenize_raw_json(
+    tokenizer: AutoTokenizer,
+    data_path: str,
+    dataset_type: dict,
+    max_length: int,
+) -> list:
+    """Tokenize raw JSON (instruct/input/output) into list of {input_ids, attention_mask, labels} when no prepared dataset exists."""
+    with open(data_path, "r") as f:
+        items = json.load(f)
+    if not items:
+        return []
+    field_instruct = dataset_type.get("field_instruction", "instruct")
+    field_input = dataset_type.get("field_input", "input")
+    field_output = dataset_type.get("field_output", "output")
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    result = []
+    for item in items:
+        instruct = item.get(field_instruct) or ""
+        inp = item.get(field_input) or ""
+        output = item.get(field_output) or ""
+        if field_input and inp:
+            prompt = f"{instruct}\n{inp}".strip()
+        else:
+            prompt = instruct.strip()
+        if not prompt and not output:
+            continue
+        # Tokenize prompt and response separately so labels align (mask prompt, keep response)
+        prompt_ids = tokenizer(prompt, add_special_tokens=True, truncation=True, max_length=max_length).input_ids
+        response_ids = tokenizer(output, add_special_tokens=False, truncation=True, max_length=max_length).input_ids if output else []
+        input_ids = prompt_ids + response_ids
+        if len(input_ids) > max_length:
+            input_ids = input_ids[:max_length]
+        labels = [-100] * len(prompt_ids) + response_ids
+        if len(labels) > max_length:
+            labels = labels[:max_length]
+        if not any(l != -100 for l in labels):
+            continue
+        # Pad to max_length
+        attention_mask = [1] * len(input_ids) + [0] * (max_length - len(input_ids))
+        input_ids = input_ids + [pad_id] * (max_length - len(input_ids))
+        labels = labels + [-100] * (max_length - len(labels))
+        result.append({
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        })
+    print(f"Tokenized {len(result)} samples from {data_path}")
+    return result
+
+
 def _load_evaluation_dataset(
-    evaluation_config: DictDefault, tokenizer: AutoTokenizer
-) -> Dataset:
+    evaluation_config: DictDefault, tokenizer: AutoTokenizer, data_path: str, dataset_type: dict
+) -> list:
     prepared_path = Path(evaluation_config.output_dir) / "prepared"
-    eval_dataset, _ = load_tokenized_prepared_datasets(
-        tokenizer, evaluation_config, prepared_path
-    )
+    if not os.path.isdir(prepared_path):
+        max_len = getattr(evaluation_config, "sequence_len", None) or 2048
+        return _tokenize_raw_json(tokenizer, data_path, dataset_type, max_len)
+    eval_dataset = load_from_disk(str(prepared_path))
 
     original_length = len(eval_dataset)
     eval_dataset = [
@@ -129,7 +180,7 @@ def _load_evaluation_dataset(
         f"Filtered out {original_length - filtered_length} samples with empty outputs"
     )
     print(f"Loaded dataset with {filtered_length} samples")
-    return eval_dataset
+    return list(eval_dataset)
 
 
 
@@ -225,7 +276,9 @@ def tokenize_dataset(
         data_path, dataset_type, "json", None, config_path, max_length
     )
     evaluation_config.tokenizer_config = tokenizer.name_or_path
-    eval_dataset = _load_evaluation_dataset(evaluation_config, tokenizer)
+    eval_dataset = _load_evaluation_dataset(
+        evaluation_config, tokenizer, data_path, dataset_type
+    )
     # now dump this
     result = []
     for i in range(len(eval_dataset)):
@@ -240,14 +293,16 @@ def tokenize_dataset(
 
 def main(training_request_path: str):
     t1 = datetime.now()
+    training_request_path = os.path.abspath(training_request_path)
+    request_dir = os.path.dirname(training_request_path)
     with open(training_request_path, "r") as file:
         training_request = json.load(file)
 
     # dataset is already downloaded at: training_request["train_request"]["dataset"]
     task_id = training_request["train_request"]["task_id"]
     total_path = training_request["train_request"]["dataset"]
-    train_path = f"datasets/train_{task_id}.json"
-    dev_path = f"datasets/dev_{task_id}.json"
+    train_path = os.path.join(request_dir, f"train_{task_id}.json")
+    dev_path = os.path.join(request_dir, f"dev_{task_id}.json")
     max_data_size = training_request["train_request"].get("max_data_size", -1)
     if max_data_size > 0:
         print(
@@ -262,9 +317,12 @@ def main(training_request_path: str):
     )
     
     config_path = "test_axolotl.yml"
-    tokenizer = AutoTokenizer.from_pretrained(
-        training_request["train_request"]["model_path"]
-    )
+    model_path = training_request["train_request"]["model_path"]
+    model_name = training_request["train_request"].get("model_name", model_path)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     max_length = -1  # default value in test_axolot.yml
@@ -279,7 +337,7 @@ def main(training_request_path: str):
         train_path,
         training_request["train_request"]["dataset_type"],
         config_path,
-        f"datasets/train_tokenized_{task_id}.json",
+        os.path.join(request_dir, f"train_tokenized_{task_id}.json"),
         max_length=max_length,
     )
     
@@ -288,7 +346,7 @@ def main(training_request_path: str):
         dev_path,
         training_request["train_request"]["dataset_type"],
         config_path,
-        f"datasets/dev_tokenized_{task_id}.json",
+        os.path.join(request_dir, f"dev_tokenized_{task_id}.json"),
         max_length=max_length,
     )
 

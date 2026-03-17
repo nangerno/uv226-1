@@ -1,4 +1,6 @@
 accelerate==1.6.0
+axolotl
+colorama
 bitsandbytes==0.45.4
 scipy==1.15.2
 sentencepiece==0.2.0

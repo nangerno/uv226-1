@@ -66,8 +66,8 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.early_stopping_patience = early_stopping_patience
         self.steps_without_improvement = 0
         self.last_improvement_step = 0
-        self.best_composite_score = None
-        self.top_checkpoints = []  # Store top 3-5 checkpoints
+        self.best_eval_loss = None  # Best test (eval) loss - main target
+        self.top_checkpoints = []  # Store top N checkpoints by eval_loss
         self.max_top_checkpoints = 3
         
     def compute_loss(self, state: TrainerState, metrics):
@@ -75,48 +75,12 @@ class CustomEvalSaveCallback(TrainerCallback):
     
     def compute_composite_score(self, state: TrainerState, metrics):
         """
-        Compute a composite score that considers multiple factors:
-        - eval_loss (primary, 70% weight)
-        - generalization gap (train_loss - eval_loss, 20% weight) - penalize overfitting
-        - step penalty (10% weight) - slightly prefer later checkpoints if similar loss
+        Optional composite score for logging only. Best checkpoint is selected by eval_loss (test loss) only.
         """
         eval_loss = metrics.get("eval_loss", None)
         if eval_loss is None:
             return None
-        
-        # Get current training loss from log history
-        train_loss = None
-        if state.log_history:
-            # Get the most recent training loss
-            for log_entry in reversed(state.log_history):
-                if "loss" in log_entry and "eval_loss" not in log_entry:
-                    train_loss = log_entry.get("loss", None)
-                    break
-        
-        # Base score is eval_loss (lower is better)
-        composite_score = eval_loss
-        
-        # Add generalization gap penalty (if train_loss is much lower than eval_loss, penalize overfitting)
-        if train_loss is not None and eval_loss > 0:
-            generalization_gap = max(0, eval_loss - train_loss)  # How much higher eval is than train
-            # Normalize gap relative to eval_loss (penalize if gap > 10% of eval_loss)
-            gap_ratio = generalization_gap / eval_loss
-            # Penalize if gap is significant (more than 10% of eval_loss)
-            if gap_ratio > 0.1:
-                composite_score += 0.15 * gap_ratio * eval_loss  # Scale penalty by gap ratio
-        
-        # Slight preference for later checkpoints if scores are very close (within 1%)
-        # This helps select more trained models when loss is similar
-        step_bonus = 0.0
-        if self.best_composite_score is not None:
-            score_diff = abs(composite_score - self.best_composite_score) / max(abs(self.best_composite_score), 1e-8)
-            if score_diff < 0.01:  # Within 1% of best score
-                # Prefer later checkpoint by small amount
-                step_bonus = -0.001 * (state.global_step / max(self.total_steps_all_epochs, 1))
-        
-        composite_score += step_bonus
-        
-        return composite_score
+        return float(eval_loss)
 
     def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
         # Custom logic to decide whether to save or evaluate
@@ -128,11 +92,17 @@ class CustomEvalSaveCallback(TrainerCallback):
             # print(f"Checking the model at step: {state.global_step}", flush=True)
             # check the time so far to estimate the training time in total 
             my_state = get_state()
-            start_time_obj = datetime.datetime.strptime(my_state["train"]["start_time"], "%Y-%m-%d %H:%M:%S")
-            start_train_time_obj = datetime.datetime.strptime(my_state["train"]["start_train_time"], "%Y-%m-%d %H:%M:%S")
+            if "train" not in my_state:
+                my_state["train"] = {}
+            train_state = my_state["train"]
+            now = datetime.datetime.now()
+            now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+            start_time_str = train_state.get("start_time") or train_state.get("start_train_time") or now_str
+            start_train_time_str = train_state.get("start_train_time") or train_state.get("start_time") or now_str
+            start_time_obj = datetime.datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S")
+            start_train_time_obj = datetime.datetime.strptime(start_train_time_str, "%Y-%m-%d %H:%M:%S")
             
             log_content = f"Checking the model at step: {state.global_step}"
-            now = datetime.datetime.now()
             preparation_time = (start_train_time_obj - start_time_obj).total_seconds()
             log_content += f"\nPreparation time: {preparation_time}"
             time_so_far = (now - start_time_obj).total_seconds()
@@ -173,9 +143,10 @@ class CustomEvalSaveCallback(TrainerCallback):
                 control.should_training_stop = True
                 control.should_save = False
                 args.save_strategy = "no"
-                # save the current loss of this step to the state;
-                last_log = state.log_history[-1]
-                my_state["train"]["current_loss"] = last_log["loss"]
+                # Use eval (test) loss for run score if already set in on_evaluate; else fallback to train loss
+                if "current_loss" not in my_state["train"]:
+                    last_log = state.log_history[-1]
+                    my_state["train"]["current_loss"] = last_log["loss"]
                 my_state["mode"] = "continue"
                 if n > MAX_TRIES:
                     n = MAX_TRIES
@@ -190,20 +161,15 @@ class CustomEvalSaveCallback(TrainerCallback):
                 print(log_content, flush=True)            
             return control
     
-        elif state.global_step == self.checking_step and self.checking_mode == "second_time": # at second time, we don't estimate the training time again, just save the current_loss
-            log_content = f"Checking the model at step: {state.global_step} where check_mode=second_time"            
+        elif state.global_step == self.checking_step and self.checking_mode == "second_time": # at second time, save eval (test) loss for this run; use it for best-run selection
+            log_content = f"Checking the model at step: {state.global_step} where check_mode=second_time"
             my_state = get_state()
-            current_loss = state.log_history[-1]["loss"]
+            # Use eval (test) loss for run selection; already updated in on_evaluate
+            current_loss = my_state["train"].get("current_loss", state.log_history[-1]["loss"])
             my_state["train"]["current_loss"] = current_loss
-                
+
             control.should_training_stop = True
 
-            # Check if current_loss > current min_loss --> do not save to save time and space
-            # 
-            # if my_state["train"]["current_loss"] > current_min_loss:
-            #     print(f"Current loss: {my_state['train']['current_loss']} is greater than the current min_loss: {current_min_loss}, do not save the checkpoint", flush=True)
-            #     control.should_save = False
-            # check if this is the last run and the current_loss is the lowest --> keep running the training
             current_is_the_best = False
             current_min_loss = min([run["current_loss"] for run in my_state["runs"]])
             if current_loss <= current_min_loss:
@@ -242,31 +208,41 @@ class CustomEvalSaveCallback(TrainerCallback):
         self, args, state: TrainerState, control: TrainerControl, metrics, **kwargs
     ):
         self.save_only = False
-        # Append eval_loss to file
+        # Test (eval) loss is the main target for best checkpoint and run selection
         eval_loss = self.compute_loss(state, metrics)
         if state.global_step < 2:
-            return 
+            return
+        if eval_loss is None:
+            return
+        eval_loss = float(eval_loss)
         print(f"GO INTO CUSTOMIZED EVALUATE AT STEP: {state.global_step}", flush=True)
-        
-        # Compute composite score for better checkpoint selection
+
+        # Store eval (test) loss in state so LR-run selection uses test loss, not train loss
+        try:
+            my_state = get_state()
+            if "train" in my_state:
+                my_state["train"]["current_loss"] = eval_loss
+                set_state(my_state)
+        except Exception:
+            pass
+
         composite_score = self.compute_composite_score(state, metrics)
         if composite_score is None:
-            composite_score = eval_loss  # Fallback to eval_loss if composite can't be computed
-        
+            composite_score = eval_loss
+
         # Initialize last_improvement_step on first evaluation if not set
         if self.last_improvement_step == 0:
             self.last_improvement_step = state.global_step
-        
-        # Check if this is a better checkpoint using composite score
-        if self.best_composite_score is None or composite_score < self.best_composite_score:
-            improvement = self.best_composite_score - composite_score if self.best_composite_score is not None else composite_score
+
+        # Best checkpoint = lowest eval (test) loss only
+        if self.best_eval_loss is None or eval_loss < self.best_eval_loss:
+            improvement = self.best_eval_loss - eval_loss if self.best_eval_loss is not None else eval_loss
             print(f"*** NEW BEST CHECKPOINT at step {state.global_step} ***", flush=True)
-            print(f"  Eval Loss: {eval_loss:.6f}", flush=True)
-            print(f"  Composite Score: {composite_score:.6f}", flush=True)
-            if self.best_composite_score is not None:
-                print(f"  Improvement: {improvement:.6f} ({improvement/abs(self.best_composite_score)*100:.2f}%)", flush=True)
-            
-            self.best_composite_score = composite_score
+            print(f"  Eval (test) Loss: {eval_loss:.6f}", flush=True)
+            if self.best_eval_loss is not None:
+                print(f"  Improvement: {improvement:.6f} ({improvement / abs(self.best_eval_loss) * 100:.2f}%)", flush=True)
+
+            self.best_eval_loss = eval_loss
             self.best_checkpoint_info = {
                 "loss": eval_loss,
                 "composite_score": composite_score,
@@ -275,23 +251,20 @@ class CustomEvalSaveCallback(TrainerCallback):
             self.update_best_checkpoint = True
             self.steps_without_improvement = 0
             self.last_improvement_step = state.global_step
-            
-            # Add to top checkpoints list
+
             self.top_checkpoints.append({
                 "step": state.global_step,
                 "eval_loss": eval_loss,
                 "composite_score": composite_score
             })
-            # Keep only top N checkpoints, sorted by composite_score
-            self.top_checkpoints.sort(key=lambda x: x["composite_score"])
+            self.top_checkpoints.sort(key=lambda x: x["eval_loss"])
             if len(self.top_checkpoints) > self.max_top_checkpoints:
                 self.top_checkpoints = self.top_checkpoints[:self.max_top_checkpoints]
         else:
-            # Calculate steps since last improvement
             self.steps_without_improvement = state.global_step - self.last_improvement_step
             if self.best_checkpoint_info is not None:
-                print(f" At step: {state.global_step} - Eval Loss: {eval_loss:.6f}, Composite: {composite_score:.6f}", flush=True)
-                print(f"  Best so far: Step {self.best_checkpoint_info['step']}, Eval Loss: {self.best_checkpoint_info['loss']:.6f}, Composite: {self.best_checkpoint_info.get('composite_score', 'N/A'):.6f}", flush=True)
+                print(f" At step: {state.global_step} - Eval (test) Loss: {eval_loss:.6f}", flush=True)
+                print(f"  Best so far: Step {self.best_checkpoint_info['step']}, Eval Loss: {self.best_checkpoint_info['loss']:.6f}", flush=True)
                 print(f"  Steps without improvement: {self.steps_without_improvement} (patience: {self.early_stopping_patience})", flush=True)
         
         # Early stopping based on validation loss plateau
@@ -343,21 +316,17 @@ class CustomEvalSaveCallback(TrainerCallback):
             if os.path.exists(self.submission_dir):
                 shutil.rmtree(self.submission_dir)
             best_eval_loss = self.best_checkpoint_info["loss"]
-            best_composite_score = self.best_checkpoint_info.get("composite_score", best_eval_loss)
             shutil.copytree(
                 os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
                 self.submission_dir
             )
             self.update_best_checkpoint = False
-            # add a loss.txt file to the submission directory with both metrics
             with open(os.path.join(self.submission_dir, "loss.txt"), "w") as f:
-                f.write(f"{self.best_checkpoint_info['step']},{best_eval_loss},{best_composite_score}")
-            
-            # Log top checkpoints for reference
+                f.write(f"{self.best_checkpoint_info['step']},{best_eval_loss}")
             if self.top_checkpoints:
-                print(f"*** Top {len(self.top_checkpoints)} checkpoints by composite score:", flush=True)
+                print(f"*** Top {len(self.top_checkpoints)} checkpoints by eval (test) loss:", flush=True)
                 for i, ckpt in enumerate(self.top_checkpoints, 1):
-                    print(f"  {i}. Step {ckpt['step']}: Eval Loss={ckpt['eval_loss']:.6f}, Composite={ckpt['composite_score']:.6f}", flush=True)
+                    print(f"  {i}. Step {ckpt['step']}: Eval Loss={ckpt['eval_loss']:.6f}", flush=True)
 
 
 class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
