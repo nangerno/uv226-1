@@ -40,6 +40,7 @@ RUN bash -c "source /workspace/axo_py/bin/activate && \
 RUN pip install uv && \
     pip install -U packaging==23.2 setuptools==75.8.0 wheel ninja && \
     uv pip install -r /workspace/scripts/training_requirements.txt --system && \
+    pip install --no-build-isolation axolotl==0.9.1 && \
     pip install hf_transfer==0.1.9 && \
     pip install tenacity==9.1.2 && \
     pip install tiktoken==0.9.0 && \

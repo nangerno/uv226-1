@@ -13,8 +13,16 @@ import subprocess
 import sys
 import uuid
 import re
-import time 
+import time
+import warnings
 from datetime import datetime, timezone, timedelta
+
+# Suppress pydantic "model_" protected namespace warnings from dependencies (e.g. datasets)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*conflict with protected namespace .*model_.*",
+    category=UserWarning,
+)
 
 import yaml
 from transformers import AutoTokenizer
@@ -44,6 +52,7 @@ from grpo_config import get_training_json as get_grpo_training_json
 import pathlib
 from transformers import AutoConfig
 import lr_utils
+from customized_trainer import get_remaining_seconds, format_remaining
 
 
 def _tf32_supported() -> bool:
@@ -89,6 +98,7 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None, cwd: s
 
         # Log the return code
         log_file.write(f"\nProcess completed with return code: {return_code}\n")
+        return return_code
 
 
 def replace_args_in_cmd(cmd: str, arg_name: str, arg_value: str):
@@ -133,7 +143,12 @@ OOM_ERROR = "torch.OutOfMemoryError: CUDA out of memory"
 VLLM_OOM_ERROR = "ValueError: No available memory for the cache blocks"
 
 PROBE_MAX_STEPS = 10  # longer probe so memory pattern is closer to full training
-PROBE_SAFETY_FACTOR = 0.75  # use 75% of probed batch for full run to avoid OOM later
+# Safety factor: use this fraction of probed max batch for full run (avoids OOM from growth over time)
+# Set env PROBE_SAFETY_FACTOR (e.g. 0.9) for less conservative batch size.
+PROBE_SAFETY_FACTOR = float(os.environ.get("PROBE_SAFETY_FACTOR", "0.75"))
+# When config batch fits, search upward up to this cap to find larger batch (default 2x config, max 128)
+PROBE_BATCH_CAP_FACTOR = float(os.environ.get("PROBE_BATCH_CAP_FACTOR", "2.0"))
+PROBE_BATCH_ABS_MAX = int(os.environ.get("PROBE_BATCH_ABS_MAX", "128"))
 
 
 def get_error_type(log_path: str):
@@ -189,7 +204,9 @@ def find_max_batch_size_through_probe(
 ) -> int:
     """
     Run short training probes to find the largest batch size that does not OOM.
-    Prefers big batch: tries the config batch size first, then binary-search down if OOM.
+    - If config batch OOMs: binary-search down in [1, config-1] for largest that fits.
+    - If config batch fits: binary-search upward up to PROBE_BATCH_CAP (default 2x config, max 128)
+      so we use GPU memory more fully. Env: PROBE_SAFETY_FACTOR, PROBE_BATCH_CAP_FACTOR, PROBE_BATCH_ABS_MAX.
     """
     output_dir = extract_value_from_cmd(train_cmd, "output_dir")
     request_path = extract_value_from_cmd(train_cmd, "request_path")
@@ -222,49 +239,128 @@ def find_max_batch_size_through_probe(
     probe_output_dir = output_dir.rstrip("/") + "_probe"
     probe_log_path = log_path + ".probe"
 
-    # Prefer big batch: try config size first; if it fits, use it (one probe).
+    # Try config size first.
     print(
         f"Probe: trying per_device_train_batch_size={initial_batch_size} (max_steps={PROBE_MAX_STEPS})",
         flush=True,
     )
-    if _run_probe(
+    if not _run_probe(
         train_cmd, initial_batch_size,
         probe_output_dir, probe_request_path, probe_log_path,
         env_vars, cwd,
     ):
+        low, high = 1, initial_batch_size - 1
+        while low < high:
+            mid = (low + high + 1) // 2
+            print(
+                f"Probe: trying per_device_train_batch_size={mid} (max_steps={PROBE_MAX_STEPS})",
+                flush=True,
+            )
+            if _run_probe(
+                train_cmd, mid,
+                probe_output_dir, probe_request_path, probe_log_path,
+                env_vars, cwd,
+            ):
+                low = mid
+            else:
+                high = mid - 1
         try:
             os.remove(probe_request_path)
         except OSError:
             pass
-        print(
-            f"Probe: selected per_device_train_batch_size={initial_batch_size} (config size fits)",
-            flush=True,
-        )
-        return initial_batch_size
+        print(f"Probe: selected per_device_train_batch_size={low}", flush=True)
+        return low
 
-    # Config size OOMs: binary search for the largest batch that fits in [1, initial_batch_size - 1].
-    low, high = 1, initial_batch_size - 1
-    while low < high:
-        mid = (low + high + 1) // 2
-        print(
-            f"Probe: trying per_device_train_batch_size={mid} (max_steps={PROBE_MAX_STEPS})",
-            flush=True,
-        )
-        if _run_probe(
-            train_cmd, mid,
-            probe_output_dir, probe_request_path, probe_log_path,
-            env_vars, cwd,
-        ):
-            low = mid
-        else:
-            high = mid - 1
+    # Config size fits: search upward to find the largest batch that still fits (more optimized use of GPU).
+    cap = min(
+        int(initial_batch_size * PROBE_BATCH_CAP_FACTOR),
+        PROBE_BATCH_ABS_MAX,
+    )
+    cap = max(cap, initial_batch_size)
+    if cap > initial_batch_size:
+        low, high = initial_batch_size, cap
+        while low < high:
+            mid = (low + high + 1) // 2
+            print(
+                f"Probe: trying per_device_train_batch_size={mid} (max_steps={PROBE_MAX_STEPS}, search up)",
+                flush=True,
+            )
+            if _run_probe(
+                train_cmd, mid,
+                probe_output_dir, probe_request_path, probe_log_path,
+                env_vars, cwd,
+            ):
+                low = mid
+            else:
+                high = mid - 1
+        best_batch = low
+    else:
+        best_batch = initial_batch_size
 
     try:
         os.remove(probe_request_path)
     except OSError:
         pass
-    print(f"Probe: selected per_device_train_batch_size={low}", flush=True)
-    return low
+    print(
+        f"Probe: selected per_device_train_batch_size={best_batch} (max that fits)",
+        flush=True,
+    )
+    return best_batch
+
+
+def run_probe_once_and_return_cmd(
+    train_cmd: str,
+    log_path: str,
+    task_id: str,
+    expected_repo_name: str,
+    cwd: str | None = None,
+    task_type: str | None = None,
+) -> str:
+    """Run batch-size probe once; return train_cmd with safe per_device_train_batch_size (and ga if needed)."""
+    training_env_vars = {
+        "WANDB_MODE": "offline",
+        "WANDB_RUN_ID": f"{task_id}_{expected_repo_name}",
+        "WANDB_NAME": f"{task_id}_{expected_repo_name}",
+    }
+    initial_batch = extract_value_from_cmd(train_cmd, "per_device_train_batch_size")
+    if not initial_batch or int(initial_batch) <= 1:
+        return train_cmd
+    best_batch = find_max_batch_size_through_probe(
+        train_cmd, log_path, cwd, training_env_vars
+    )
+    # DPO without padding_free uses more memory per batch; use a more conservative safety factor (task-type only, no dataset/model constants)
+    safety = PROBE_SAFETY_FACTOR
+    if task_type == TaskType.DPOTASK.value:
+        safety = float(os.environ.get("PROBE_SAFETY_FACTOR_DPO", "0.5"))
+    safe_batch = max(1, int(best_batch * safety))
+    if safe_batch < best_batch:
+        print(
+            f"Probe passed at {best_batch}; using safe batch {safe_batch} ({int(safety*100)}% margin for full run)",
+            flush=True,
+        )
+    new_cmd = replace_args_in_cmd(
+        train_cmd, "per_device_train_batch_size", str(safe_batch)
+    )
+    if new_cmd is not None:
+        train_cmd = new_cmd
+    if safe_batch <= 4:
+        ga = extract_value_from_cmd(train_cmd, "gradient_accumulation_steps")
+        current_ga = int(ga) if ga else 1
+        target_effective = 8
+        new_ga = max(current_ga, (target_effective + safe_batch - 1) // safe_batch)
+        if new_ga != current_ga:
+            ga_cmd = replace_args_in_cmd(train_cmd, "gradient_accumulation_steps", str(new_ga))
+            if ga_cmd is not None:
+                train_cmd = ga_cmd
+                print(
+                    f"Boosted gradient_accumulation_steps {current_ga} -> {new_ga} (effective batch >= {target_effective})",
+                    flush=True,
+                )
+    print(
+        f"Starting full training with per_device_train_batch_size={safe_batch}",
+        flush=True,
+    )
+    return train_cmd
 
 
 def run_training(
@@ -281,43 +377,6 @@ def run_training(
         "WANDB_RUN_ID": f"{task_id}_{expected_repo_name}",
         "WANDB_NAME": f"{task_id}_{expected_repo_name}",
     }
-
-    # Probe phase: find max batch size by increasing until OOM (avoids wasting full runs on OOM)
-    initial_batch = extract_value_from_cmd(train_cmd, "per_device_train_batch_size")
-    if initial_batch and int(initial_batch) > 1:
-        best_batch = find_max_batch_size_through_probe(
-            train_cmd, log_path, cwd, training_env_vars
-        )
-        # Use safety margin so full run doesn't OOM (probe is short; memory can grow later)
-        safe_batch = max(1, int(best_batch * PROBE_SAFETY_FACTOR))
-        if safe_batch < best_batch:
-            print(
-                f"Probe passed at {best_batch}; using safe batch {safe_batch} ({int(PROBE_SAFETY_FACTOR*100)}% margin for full run)",
-                flush=True,
-            )
-        new_cmd = replace_args_in_cmd(
-            train_cmd, "per_device_train_batch_size", str(safe_batch)
-        )
-        if new_cmd is not None:
-            train_cmd = new_cmd
-        # When batch size is small, boost gradient accumulation so effective batch >= 8 (better quality)
-        if safe_batch <= 4:
-            ga = extract_value_from_cmd(train_cmd, "gradient_accumulation_steps")
-            current_ga = int(ga) if ga else 1
-            target_effective = 8
-            new_ga = max(current_ga, (target_effective + safe_batch - 1) // safe_batch)
-            if new_ga != current_ga:
-                ga_cmd = replace_args_in_cmd(train_cmd, "gradient_accumulation_steps", str(new_ga))
-                if ga_cmd is not None:
-                    train_cmd = ga_cmd
-                    print(
-                        f"Boosted gradient_accumulation_steps {current_ga} -> {new_ga} (effective batch >= {target_effective})",
-                        flush=True,
-                    )
-        print(
-            f"Starting full training with per_device_train_batch_size={safe_batch}",
-            flush=True,
-        )
 
     for i in range(retries):
         print(
@@ -491,6 +550,10 @@ def main():
         args.task_id, repo_name
     )
     print(f"submission_dir: {submission_dir}", flush=True)
+    print(
+        "Tournament ranking: lower test (eval) loss = better = top.",
+        flush=True,
+    )
     if not os.path.exists(submission_dir):
         os.makedirs(submission_dir, exist_ok=True)
 
@@ -588,13 +651,34 @@ def main():
     with open(request_path, "w") as f:
         json.dump(train_info, f, indent=4, ensure_ascii=False)
 
-    run_cmd_with_log(
+    tokenize_ret = run_cmd_with_log(
         tokenize_cmd, os.path.join(ds_folder, f"tokenize_{args.task_id}.log"), cwd=script_dir
     )
+    if tokenize_ret != 0:
+        raise RuntimeError(
+            f"Tokenization failed with exit code {tokenize_ret}. "
+            f"Check {os.path.join(ds_folder, f'tokenize_{args.task_id}.log')}"
+        )
 
     original_train_cmd = train_cmd
     if not _tf32_supported():
         original_train_cmd = original_train_cmd.replace("--tf32 True", "--tf32 False")
+
+    # Run batch-size probe once (not per attempt) so we don't repeat probe before every run
+    request_path_0 = os.path.join(ds_folder, f"training_request_{args.task_id}_0.json")
+    with open(request_path_0, "w") as f:
+        json.dump(train_info, f, indent=4, ensure_ascii=False)
+    first_train_cmd = replace_args_in_cmd(
+        original_train_cmd, "output_dir", output_dir + "_0"
+    )
+    first_train_cmd = replace_args_in_cmd(
+        first_train_cmd, "request_path", request_path_0
+    )
+    log_path_0 = os.path.join(ds_folder, f"train_{args.task_id}.log")
+    original_train_cmd = run_probe_once_and_return_cmd(
+        first_train_cmd, log_path_0, args.task_id, repo_name, cwd=script_dir, task_type=args.task_type
+    )
+
     train_success = False
     state = get_state()
     state = {}
@@ -609,7 +693,6 @@ def main():
         state = get_state()
         train_cmd = original_train_cmd  # will replace based on the state later
         c_train_info = copy.deepcopy(train_info)
-        final_output_dir = None
         if args.task_type == TaskType.GRPOTASK.value:
             state["mode"] = "finish" # do not run this for GRPO task
             c_train_info["train_request"]["checking_mode"] = "none"
@@ -633,29 +716,39 @@ def main():
                     index = len(state["runs"])
                     current_lr = state["lrs"][index]
                     train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
-                else: # the final run
-                    # first find from runs the best loss
+                else:
+                    # LR search done: run main training with best LR until given time, then submit
                     c_train_info["train_request"]["checking_mode"] = "none"
                     index = np.argmin([run["current_loss"] for run in state["runs"]])
-                    print(f"Best run by eval (test) loss; index={index}; eval_loss={state['runs'][index]['current_loss']}; lr={state['lrs'][index]}", flush=True)
-                    train_cmd = state["runs"][index]["train_cmd"]  #replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
-                    final_output_dir = state["runs"][index]["output_dir"]
-                    state["mode"] = "finish"
+                    best_lr = state["lrs"][index]
+                    best_eval = state["runs"][index]["current_loss"]
+                    end_time_str = train_info.get("end_time") or train_info.get("train_request", {}).get("end_time", "")
+                    remaining = get_remaining_seconds(end_time_str) if end_time_str else 0.0
+                    print(
+                        f"Remaining time until end_time: {format_remaining(remaining)}",
+                        flush=True,
+                    )
+                    print(
+                        f"Best LR by eval (test) loss: index={index}, lr={best_lr}, eval_loss={best_eval:.6f}. Starting main training with this LR until end_time.",
+                        flush=True,
+                    )
+                    train_cmd = state["runs"][index]["train_cmd"]
+                    state["mode"] = "finish"  # after this main run we break
             else: # the state = finish; no need to run more
                 assert state["mode"] == "finish"
                 break
         
         set_state(state)
         if train_cmd:
-            run_output_dir = output_dir + f"_{count}" if not final_output_dir else final_output_dir
+            run_output_dir = output_dir + f"_{count}"
             train_cmd = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
-            
+
             current_request_path = os.path.join(ds_folder, f"training_request_{args.task_id}_{count}.json")
             with open(current_request_path, "w") as f:
                 json.dump(c_train_info, f, indent=4, ensure_ascii=False)
-            
+
             train_cmd = replace_args_in_cmd(train_cmd, "request_path", current_request_path)
-            
+
             state["train"] = {
                 "train_cmd": train_cmd,
                 "log_path": os.path.join(ds_folder, f"train_{args.task_id}.log"),
@@ -663,11 +756,15 @@ def main():
                 "output_dir": run_output_dir
             }
             state["train"]["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
+
             set_state(state)
-            
+
             log_path = state["train"]["log_path"]
-            # print(f"Run training with train_info: {c_train_info}", flush=True)
+            # Probe already ran once; "attempt 1/5" here is the first try of this phase (up to 5 retries on OOM/failure)
+            print(
+                f"Training phase count={count} (output_dir={run_output_dir}); retries on failure: up to 5",
+                flush=True,
+            )
             success = run_training(
                 train_cmd,
                 log_path,

@@ -1,4 +1,12 @@
 from typing import Dict, Optional
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=r".*conflict with protected namespace .*model_.*",
+    category=UserWarning,
+)
+
 import requests
 import json
 import random
@@ -25,7 +33,14 @@ from peft import (
 from transformers import TrainerCallback
 import argparse
 import os
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
+from customized_trainer import (
+    resize_if_needed,
+    set_generation_config,
+    CustomEvalSaveCallback,
+    WhenToEvalHandler,
+    get_early_stopping_patience,
+    init_wandb,
+)
 from state_manager import get_state, set_state
 
 # from packing.packed_dataset import PackedDataset
@@ -157,10 +172,21 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # max_length = get_max_length_config()
-    # if "max_length" in train_request:
-    #     max_length = train_request["max_length"]
-    # default implementation, max_length=1024 (prompt + completion), max_prompt_length=512
+    # Cap max_length by tokenizer capacity to avoid "sequence length longer than model" and OOM (generic, no dataset/model constants)
+    model_max = getattr(tokenizer, "model_max_length", None) or 131072
+    if model_max > 2**20:
+        model_max = 8192  # avoid unbounded or huge context for memory
+    req_max = getattr(training_args, "max_length", 1024)
+    req_prompt = getattr(training_args, "max_prompt_length", 512)
+    training_args.max_length = min(req_max, model_max)
+    training_args.max_prompt_length = min(req_prompt, training_args.max_length)
+    if training_args.max_length < req_max or training_args.max_prompt_length < req_prompt:
+        log_info(f"Capped max_length to {training_args.max_length}, max_prompt_length to {training_args.max_prompt_length} (tokenizer/model limit)")
+
+    # Avoid wandb warning: run_name must differ from output_dir
+    if not getattr(training_args, "run_name", None) or str(training_args.run_name).strip() == str(training_args.output_dir).strip():
+        training_args.run_name = (training_args.output_dir or "dpo_run").rstrip("/") + "_run"
+        log_info(f"Set run_name={training_args.run_name}")
 
     train_path = os.path.join("datasets", f"dpo_train_{task_id}.json")
     dev_path = os.path.join("datasets", f"dpo_dev_{task_id}.json")
@@ -212,6 +238,13 @@ def main():
         if getattr(training_args, "padding_free", False):
             training_args.padding_free = False
             log_info("Disabled padding_free (recommended only with flash_attention_2)")
+
+    # DPO concatenated_forward expects position_ids to have 2*num_examples zeros (one per chosen/rejected
+    # sequence). With padding_free=True, TRL packs into 2 long sequences so only 2 zeros exist, causing
+    # IndexError: index N out of bounds for dimension 0 with size 2. Disable padding_free to fix.
+    if getattr(training_args, "padding_free", False):
+        training_args.padding_free = False
+        log_info("Disabled padding_free for DPO (avoids position_ids IndexError in concatenated_forward)")
 
     model_kwargs = dict(
         revision=model_args.model_revision,
@@ -296,7 +329,7 @@ def main():
                 * training_args.world_size
             )
     
-    total_steps_all_epochs = total_steps_per_epoch * training_args.num_train_epochs
+    total_steps_all_epochs = int(total_steps_per_epoch * training_args.num_train_epochs)
     log_info(f"total_steps_per_epoch: {total_steps_per_epoch}; total_steps_all_epochs: {total_steps_all_epochs}")
     
     
@@ -308,7 +341,13 @@ def main():
     checking_step = train_request["checking_step"]
     if checking_step >= total_steps_per_epoch:
         checking_step = total_steps_per_epoch - 2
-    
+
+    early_stopping_patience = get_early_stopping_patience(
+        total_steps_per_epoch,
+        total_steps_all_epochs,
+        explicit=train_request.get("early_stopping_patience"),
+    )
+    log_info(f"early_stopping_patience: {early_stopping_patience} (adaptive from run length unless set in config)")
 
     trainer = DPOTrainer(
         model=model,
@@ -329,7 +368,7 @@ def main():
                 total_steps_all_epochs=total_steps_all_epochs,
                 end_time=train_request["end_time"],
                 checking_mode=train_request.get("checking_mode", "none"),
-                early_stopping_patience=train_request.get("early_stopping_patience", 250)
+                early_stopping_patience=early_stopping_patience,
             )
         ],
     )

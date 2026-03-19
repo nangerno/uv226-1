@@ -7,6 +7,7 @@ from transformers import (
     TrainerControl,
 )
 import os
+import time
 from typing import Callable, Optional, Dict
 import shutil
 import json
@@ -14,8 +15,6 @@ from transformers.trainer_utils import is_main_process
 import wandb
 import torch
 from state_manager import get_state, set_state
-MAX_TRIES = 9
-
 
 MIS_MATCH_VOCAB_SIZE_MODELS = [
     'NousResearch/Nous-Capybara-7B-V1',
@@ -69,6 +68,9 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.best_eval_loss = None  # Best test (eval) loss - main target
         self.top_checkpoints = []  # Store top N checkpoints by eval_loss
         self.max_top_checkpoints = 3
+        # For main run: estimate time per step so we can stop early if full epoch would exceed remaining time
+        self._last_step_wall_time = None
+        self._time_per_step_est = None
         
     def compute_loss(self, state: TrainerState, metrics):
         return metrics.get("eval_loss", None)
@@ -114,16 +116,27 @@ class CustomEvalSaveCallback(TrainerCallback):
             total_remaining_training_time = time_for_one_step * (self.total_steps_all_epochs - state.global_step)
             log_content += f"\nTotal remaining training time: {total_remaining_training_time}"
             # n * time_so_far + total_remaining_training_time = total_remaining_time
-            end_time_obj = datetime.datetime.strptime(self.end_time, "%Y-%m-%d %H:%M:%S")
-            total_remaining_time = (end_time_obj - now).total_seconds()
-            log_content += f"\nTotal remaining time: {total_remaining_time}"
+            total_remaining_time = get_remaining_seconds(self.end_time)
+            log_content += f"\nTotal remaining time: {total_remaining_time:.1f} sec"
+            log_content += f"\nRemaining time until end_time: {format_remaining(total_remaining_time)}"
             
-            # n * time_so_far + (time_so_far + total_remaining_training_time) = total_remaining_time
-            # time_so_far + total_remaining_training_time is the time it takes to finish the training (need to estimate the eval time and save time, assuming this is 15 minutes)
-            # assuming time_so_far is + 5 minutes, just in case the checking step takes more time than expected
+            # Compute from remaining time: reserve fraction for main, derive max LR runs ceiling
+            buffer_seconds = 12 * 60  # eval/save/overhead
             max_var_time_sofar = 3 * 60
-            n = (total_remaining_time - (time_so_far + total_remaining_training_time + 12 * 60)) / (time_so_far + max_var_time_sofar) # 300 = 5 minutes, assume that it extra time would be more or less 5 minutes
-            n = int(n)
+            time_per_run = max(time_so_far + max_var_time_sofar, 60.0)
+            # Reserve for main: fraction of total_remaining_time (e.g. 25%), or one full run if longer
+            main_fraction = float(os.environ.get("MIN_MAIN_TRAINING_FRACTION", "0.25"))
+            main_fraction = max(0.1, min(0.5, main_fraction))
+            min_main_seconds = total_remaining_time * main_fraction
+            time_reserved_for_main = max(total_remaining_training_time, min_main_seconds)
+            time_available_for_short_runs = total_remaining_time - time_so_far - buffer_seconds - time_reserved_for_main
+            n = time_available_for_short_runs / time_per_run
+            n = max(0, int(n))
+            # Max LR runs ceiling: from budget (how many short runs fit in remaining time), with sane bounds
+            max_lr_runs_from_budget = max(2, int(total_remaining_time / time_per_run))
+            max_lr_runs_ceiling = min(200, max_lr_runs_from_budget)
+            if os.environ.get("MAX_LR_RUNS", "").strip():
+                max_lr_runs_ceiling = int(os.environ.get("MAX_LR_RUNS", str(max_lr_runs_ceiling)))
             my_state["check_details"] = {
                 "now": str(now.strftime("%Y-%m-%d %H:%M:%S")),
                 "start_time": str(start_time_obj.strftime("%Y-%m-%d %H:%M:%S")),
@@ -138,23 +151,24 @@ class CustomEvalSaveCallback(TrainerCallback):
                 "total_remaining_time": total_remaining_time,
                 "end_time": self.end_time,
             }
-            if n > 0: # we should try more 
-                log_content += f"\nEstimated number of steps to complete the training: {n}"
-                control.should_training_stop = True
-                control.should_save = False
-                args.save_strategy = "no"
-                # Use eval (test) loss for run score if already set in on_evaluate; else fallback to train loss
-                if "current_loss" not in my_state["train"]:
-                    last_log = state.log_history[-1]
-                    my_state["train"]["current_loss"] = last_log["loss"]
-                my_state["mode"] = "continue"
-                if n > MAX_TRIES:
-                    n = MAX_TRIES
-                log_content += f"\nFinal number: {n + 1}"
-                my_state["next_runs"] = n + 1 # including the current run
+            # Always continue to LR search then main; when n==0 only current run, then main with remaining time
+            reserve_min = int(time_reserved_for_main / 60)
+            log_content += f"\nEstimated short runs from remaining time: {n} (reserve {reserve_min}min for main, {main_fraction*100:.0f}% of remaining)"
+            control.should_training_stop = True
+            control.should_save = False
+            args.save_strategy = "no"
+            if "current_loss" not in my_state["train"]:
+                last_log = state.log_history[-1]
+                my_state["train"]["current_loss"] = last_log["loss"]
+            my_state["mode"] = "continue"
+            # next_runs from remaining time (reserving fraction for main), capped by computed ceiling; at least 1
+            next_runs = min(n + 1, max_lr_runs_ceiling)
+            next_runs = max(1, next_runs)
+            if next_runs < 2:
+                log_content += f"\nFinal number: {next_runs} (no time for extra LR runs; main training will use remaining time)"
             else:
-                print(f"Time is not enough so we will finish the training", flush=True)
-                my_state["mode"] = "finish"
+                log_content += f"\nFinal number: {next_runs} (from remaining time, reserve {reserve_min}min for main, cap={max_lr_runs_ceiling})"
+            my_state["next_runs"] = next_runs
             
             if is_main_process(LOCAL_RANK):
                 set_state(my_state)
@@ -168,39 +182,62 @@ class CustomEvalSaveCallback(TrainerCallback):
             current_loss = my_state["train"].get("current_loss", state.log_history[-1]["loss"])
             my_state["train"]["current_loss"] = current_loss
 
+            # Always stop at checking_step so a separate main run (with high max_steps / until end_time) can run
             control.should_training_stop = True
-
-            current_is_the_best = False
             current_min_loss = min([run["current_loss"] for run in my_state["runs"]])
             if current_loss <= current_min_loss:
-                if len(my_state["runs"]) + 1 == my_state["next_runs"]:
-                    print(f"Current loss: {my_state['train']['current_loss']} is greater than: {current_min_loss}", flush=True)
-                    current_is_the_best = True
-                    
-            if current_is_the_best:
-                control.should_training_stop = False
-                my_state["mode"] = "finish"
+                print(f"Current run eval loss {current_loss:.6f} <= best so far {current_min_loss:.6f}; stopping at checking_step (main run will use best LR until end_time).", flush=True)
             else:
-                control.should_save = False
-                args.save_strategy = "no"
+                print(f"Current run eval loss {current_loss:.6f} > best {current_min_loss:.6f}; stopping this run.", flush=True)
+            control.should_save = False
+            args.save_strategy = "no"
             
             if is_main_process(LOCAL_RANK):
                 set_state(my_state)
                 # print(log_content, flush=True)
         
-            
+        # Main run only: update time-per-step estimate so we can stop early if full epoch would exceed remaining time
+        if self.checking_mode == "none" and state.global_step > 0:
+            now = time.time()
+            if self._last_step_wall_time is not None:
+                elapsed = now - self._last_step_wall_time
+                if self._time_per_step_est is None:
+                    self._time_per_step_est = elapsed
+                else:
+                    self._time_per_step_est = 0.95 * self._time_per_step_est + 0.05 * elapsed
+            self._last_step_wall_time = now
+
         when_to_eval = self.function_when_to_evaluate(state.global_step)
+        # Main run: if time to complete full epoch would exceed remaining time, stop early (before 3 min remaining)
+        if (
+            self.checking_mode == "none"
+            and self.total_steps_all_epochs > 0
+            and self._time_per_step_est
+            and state.global_step > 0
+        ):
+            steps_left = self.total_steps_all_epochs - state.global_step
+            if steps_left > 0:
+                time_needed = steps_left * self._time_per_step_est
+                remaining = get_remaining_seconds(self.end_time)
+                if remaining > 0 and time_needed > remaining:
+                    when_to_eval = {"eval": True, "reason": "end_time"}
+                    print(
+                        f"Full epoch would exceed remaining time (need ~{time_needed/60:.1f} min, have {format_remaining(remaining)}); stopping early.",
+                        flush=True,
+                    )
         if when_to_eval["eval"]:
-            # do not allow the pod to be stopped by any reason 
-                # first check if there is at least one checkpoint or not 
-            print(f"Evaluating the model at step: {state.global_step} the reason: {when_to_eval['reason']}", flush=True)
+            remaining = get_remaining_seconds(self.end_time)
+            print(f"Remaining time until end_time: {format_remaining(remaining)} | Evaluating at step {state.global_step}, reason: {when_to_eval['reason']}", flush=True)
             control.should_evaluate = True
             control.should_save = True
             if when_to_eval["reason"] == "end_time":
-                if not self.has_checkpoint: # if there is no checkpoint, we just save the model, do not evaluate
+                if not self.has_checkpoint:
                     print(f"No checkpoint found, just save the model at step: {state.global_step}", flush=True)
                     control.should_evaluate = False
                     self.save_only = True
+                # Stop when remaining time almost reached; submit best checkpoint even if real epoch not completed
+                control.should_training_stop = True
+                print(f"Remaining time almost reached: stopping and submitting best checkpoint (step {state.global_step}, epoch may be incomplete).", flush=True)
         return control
 
 
@@ -323,6 +360,9 @@ class CustomEvalSaveCallback(TrainerCallback):
             self.update_best_checkpoint = False
             with open(os.path.join(self.submission_dir, "loss.txt"), "w") as f:
                 f.write(f"{self.best_checkpoint_info['step']},{best_eval_loss}")
+            # Tournament ranking: lower test_eval_loss = better = top (loss.txt: step,test_eval_loss)
+            with open(os.path.join(self.submission_dir, "metric.txt"), "w") as f:
+                f.write("test_eval_loss\n# Ranking: lower value = better (top)")
             if self.top_checkpoints:
                 print(f"*** Top {len(self.top_checkpoints)} checkpoints by eval (test) loss:", flush=True)
                 for i, ckpt in enumerate(self.top_checkpoints, 1):
@@ -351,14 +391,49 @@ class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
             return eval_loss * 3
 
 
-def check_remaining_time_less_than_minutes(end_time: str, minutes: int) -> bool: 
-    end_time = datetime.datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
-    end_time = end_time.replace(tzinfo=timezone.utc)  # Make end_time timezone-aware in UTC
+def get_remaining_seconds(end_time_str: str) -> float:
+    """Return seconds until end_time (negative if past)."""
+    et = datetime.datetime.strptime(end_time_str.strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     now = datetime.datetime.now(timezone.utc)
-    time_diff = end_time - now
-    result =  time_diff.total_seconds() < minutes * 60
+    return (et - now).total_seconds()
+
+
+def format_remaining(remaining_sec: float) -> str:
+    """Human-readable remaining time for logs."""
+    if remaining_sec < 0:
+        return "0 min (past end_time)"
+    return f"{remaining_sec / 60:.1f} min ({int(remaining_sec)} sec)"
+
+
+def get_early_stopping_patience(
+    total_steps_per_epoch: int,
+    total_steps_all_epochs: int,
+    explicit: Optional[int] = None,
+    min_patience: int = 5,
+    max_patience: int = 500,
+    fraction_of_run: float = 0.3,
+) -> int:
+    """
+    Adaptive early-stopping patience for unknown dataset/model sizes in tournaments.
+    Uses explicit value if provided; else: at least one epoch, at most max_patience,
+    otherwise fraction_of_run of total steps (so short runs don't stop too soon, long runs get a reasonable window).
+    """
+    if explicit is not None and explicit > 0:
+        return int(explicit)
+    if total_steps_all_epochs <= 0:
+        return max_patience
+    patience = max(
+        total_steps_per_epoch,  # at least one full epoch without improvement
+        min(max_patience, int(fraction_of_run * total_steps_all_epochs)),
+    )
+    return max(min_patience, patience)
+
+
+def check_remaining_time_less_than_minutes(end_time: str, minutes: int) -> bool:
+    remaining = get_remaining_seconds(end_time)
+    result = remaining < minutes * 60
     if result:
-        print(f"*** current time: {now} end_time: {end_time} time_diff: {time_diff}", flush=True)
+        print(f"*** Remaining time until end_time: {format_remaining(remaining)} - threshold {minutes} min", flush=True)
     return result
 
 
@@ -380,9 +455,9 @@ class WhenToEvalHandler:
             return {"eval": True, "reason": "periodic"}
         
         if self.save_before_remaining_time > 0 and not self.run_eval:
-            if check_remaining_time_less_than_minutes(self.end_time, self.save_before_remaining_time):
-                print(f"***ALERT: The time is about to run out need to eval & save the model", flush=True)
-                # the eval time might be higher than the end_time, so we need to let the pod not stop by setting a flag for this
+            remaining = get_remaining_seconds(self.end_time)
+            if remaining < self.save_before_remaining_time * 60:
+                print(f"***ALERT: Remaining time until end_time: {format_remaining(remaining)} - eval & save then stop", flush=True)
                 self.run_eval = True
                 return {"eval": True, "reason": "end_time"}
         

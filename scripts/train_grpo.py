@@ -1,4 +1,12 @@
 from typing import Dict, Optional
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=r".*conflict with protected namespace .*model_.*",
+    category=UserWarning,
+)
+
 import requests
 import json
 import random
@@ -28,7 +36,14 @@ import traceback
 from transformers import TrainerCallback
 import argparse
 import math
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
+from customized_trainer import (
+    resize_if_needed,
+    set_generation_config,
+    CustomEvalSaveCallback,
+    WhenToEvalHandler,
+    get_early_stopping_patience,
+    init_wandb,
+)
 from transformers.modeling_utils import is_deepspeed_zero3_enabled
 import os
 import glob
@@ -48,7 +63,14 @@ import bitsandbytes as bnb
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import yaml
 from tokenize_grpo import get_dataset
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
+from customized_trainer import (
+    resize_if_needed,
+    set_generation_config,
+    CustomEvalSaveCallback,
+    WhenToEvalHandler,
+    get_early_stopping_patience,
+    init_wandb,
+)
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 GRPO_DEFAULT_NUM_GENERATIONS = 2
@@ -73,6 +95,8 @@ class TrainingArguments(GRPOConfig):
     request_path: Optional[str] = field(default=None)
     use_liger: Optional[bool] = field(default=False)
     disable_fa: Optional[bool] = field(default=False)
+    # Accept --vllm_mode from run_cmd (e.g. colocate); some TRL versions omit it from GRPOConfig
+    vllm_mode: Optional[str] = field(default=None, metadata={"help": "vLLM mode: server or colocate"})
 
 
 def find_all_linear_names(model):
@@ -484,6 +508,21 @@ def main():
             log_info("vLLM is not installed; setting use_vllm=False (install with: pip install trl[vllm] for vLLM-backed generation)")
             training_args.use_vllm = False
 
+    # If use_vllm is True, GRPOTrainer will try to reach the vLLM server (even in colocate mode). If no server
+    # is reachable (e.g. single-container tournament), fall back to eager generation to avoid 240s timeout.
+    if getattr(training_args, "use_vllm", False):
+        host = getattr(training_args, "vllm_server_host", "0.0.0.0") or "0.0.0.0"
+        port = getattr(training_args, "vllm_server_port", 8000) or 8000
+        try:
+            url = f"http://{host}:{port}/health/"
+            r = requests.get(url, timeout=5)
+            if r.status_code != 200:
+                training_args.use_vllm = False
+                log_info(f"vLLM server at {host}:{port} returned {r.status_code}; falling back to eager generation")
+        except Exception as e:
+            training_args.use_vllm = False
+            log_info(f"vLLM server at {host}:{port} not reachable ({e}); falling back to eager generation (no separate server needed)")
+
     # Without vLLM, generation uses more GPU memory (eager attention); reduce batch and length to avoid OOM
     if not getattr(training_args, "use_vllm", True):
         gen_batch = getattr(training_args, "generation_batch_size", None)
@@ -495,6 +534,17 @@ def main():
             training_args.max_completion_length = 128
             log_info(f"Without vLLM, reduced max_completion_length to 128 to avoid OOM (was {max_comp})")
 
+    total_steps_all_epochs = int(total_steps_per_epoch * training_args.num_train_epochs)
+    early_stopping_patience = get_early_stopping_patience(
+        total_steps_per_epoch,
+        total_steps_all_epochs,
+        explicit=train_request.get("early_stopping_patience"),
+    )
+    log_info(f"early_stopping_patience: {early_stopping_patience} (adaptive from run length unless set in config)")
+
+    end_time_str = train_request.get("end_time") or train_info.get("end_time", "")
+    save_before = train_request.get("save_before_remaining_time", 3)
+
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=wrapped_reward_funcs,
@@ -505,16 +555,16 @@ def main():
         peft_config=peft_config,
         callbacks=[
             CustomEvalSaveCallback(
-                WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
+                WhenToEvalHandler(end_time_str, save_before, periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
                 train_request["submission_dir"],
                 training_args.output_dir,
                 train_request["model_name"],
                 max_steps,
                 checking_step=train_request.get("checking_step", 100),
-                total_steps_all_epochs=total_steps_per_epoch * training_args.num_train_epochs,
-                end_time=train_request["end_time"],
+                total_steps_all_epochs=total_steps_all_epochs,
+                end_time=end_time_str,
                 checking_mode=train_request.get("checking_mode", "none"),
-                early_stopping_patience=train_request.get("early_stopping_patience", 300)
+                early_stopping_patience=early_stopping_patience,
             )
         ],
     )

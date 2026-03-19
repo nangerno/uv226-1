@@ -13,6 +13,7 @@ import json
 import torch
 
 MODEL_CONFIG = {
+    "Qwen/Qwen1.5-0.5B": {"model_size": 500_000_000},
     "facebook/opt-1.3b": {"model_size": 1_300_000_000},
     "facebook/opt-3b": {"model_size": 3_000_000_000},
     "facebook/opt-6.7b": {"model_size": 6_700_000_000},
@@ -112,11 +113,10 @@ def get_model_num_params(model_id: str, model_path: str) -> int:
 
     except Exception as e:
         try:
-            model_size = re.search(r"(\d+)(?=[bB])", model_id)
-            model_size = (
-                int(model_size.group(1)) * 1_000_000_000 if model_size else None
-            )
-            if model_size is not None:
+            # Match e.g. 0.5B, 1.5B, 7B (optional decimal before b/B)
+            m = re.search(r"(\d+(?:\.\d+)?)\s*[bB]", model_id)
+            if m:
+                model_size = int(float(m.group(1)) * 1_000_000_000)
                 print(f"Model size from regex: {model_size}")
                 return model_size
         except Exception as regex_e:

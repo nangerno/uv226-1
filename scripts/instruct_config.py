@@ -150,6 +150,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --request_path {request_path} \
     --bf16 True \
     --report_to wandb \
+    --run_name {run_name} \
     --output_dir {output_dir} \
     --num_train_epochs {epoch_num} \
     --per_device_train_batch_size {batch_size} \
@@ -207,6 +208,7 @@ def get_training_json(train_info: dict) -> dict:
         "packing": "True",
         "gpu_nums": config["gpu_count"],
         "output_dir": train_info["output_dir"],
+        "run_name": train_info["output_dir"] + "_run",
         "request_path": train_info["request_path"],
         "distributed": config.get("distributed", "ddp"),
         "gradient_checkpointing": "True",
@@ -276,8 +278,8 @@ def get_training_json(train_info: dict) -> dict:
 
     run_config["learning_rate"] *= train_info["reg_ratio"]
     checking_step = 70
-    # Eval at or before checking_step so run selection uses test (eval) loss
-    run_config["eval_steps"] = min(100, checking_step)
+    # Eval before checking_step so at first_time we have test (eval) loss for run selection, not train loss
+    run_config["eval_steps"] = min(50, max(10, checking_step - 15))
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
     train_request = deepcopy(train_info)
     train_request["save_before_remaining_time"] = 3

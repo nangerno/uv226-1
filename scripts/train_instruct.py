@@ -1,4 +1,13 @@
 from typing import Dict, Optional
+import warnings
+
+# Suppress pydantic "model_" protected namespace warnings from dependencies (e.g. datasets)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*conflict with protected namespace .*model_.*",
+    category=UserWarning,
+)
+
 import requests
 import json
 import random
@@ -10,7 +19,14 @@ import torch
 from transformers.trainer_utils import is_main_process
 from dataclasses import dataclass, field
 from transformers import Trainer
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
+from customized_trainer import (
+    resize_if_needed,
+    set_generation_config,
+    CustomEvalSaveCallback,
+    WhenToEvalHandler,
+    get_early_stopping_patience,
+    init_wandb,
+)
 
 # from packing.packed_dataset import PackedDataset
 from transformers import (
@@ -362,6 +378,7 @@ def main():
     training_args.save_only_model = True  # only save the model, not the optimizer
     
     max_steps = train_request.get("max_steps", -1)
+    checking_mode = train_request.get("checking_mode", "none")
     log_info(f"max_steps: {max_steps}")
     
     start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -372,14 +389,20 @@ def main():
     if is_main_process(LOCAL_RANK):
         set_state(state)
         
+    # Trainer expects num_train_epochs to be int for range(epochs_trained, num_train_epochs)
+    training_args.num_train_epochs = int(training_args.num_train_epochs)
     total_steps_per_epoch = len(train_ds) // (
                 training_args.per_device_train_batch_size
                 * training_args.gradient_accumulation_steps
                 * training_args.world_size
             )
-    
-    total_steps_all_epochs = total_steps_per_epoch * training_args.num_train_epochs
+    total_steps_all_epochs = int(total_steps_per_epoch * training_args.num_train_epochs)
     log_info(f"total_steps_per_epoch: {total_steps_per_epoch}; total_steps_all_epochs: {total_steps_all_epochs}")
+    # Main run: stop at real epoch boundary (e.g. 126 steps) even if time remains; or stop earlier when remaining time almost reached
+    if checking_mode == "none":
+        training_args.max_steps = total_steps_all_epochs
+        max_steps = total_steps_all_epochs
+        log_info(f"main run: stop at real epoch (max_steps={max_steps}) when time remains; or stop earlier when remaining < 3 min or when full epoch would exceed remaining time")
     
     success_file = os.path.join(training_args.output_dir, "success.txt")
     # remove the success file if it exists
@@ -389,12 +412,20 @@ def main():
     checking_step = train_request["checking_step"]
     if checking_step >= total_steps_per_epoch:
         checking_step = total_steps_per_epoch - 2
-    
+
+    early_stopping_patience = get_early_stopping_patience(
+        total_steps_per_epoch,
+        total_steps_all_epochs,
+        explicit=train_request.get("early_stopping_patience"),
+    )
+    log_info(f"early_stopping_patience: {early_stopping_patience} (adaptive from run length unless set in config)")
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=dev_ds,
+        processing_class=tokenizer,
         callbacks=[
             CustomEvalSaveCallback(
                 WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
@@ -406,12 +437,11 @@ def main():
                 total_steps_all_epochs=total_steps_all_epochs,
                 end_time=train_request["end_time"],
                 checking_mode=train_request.get("checking_mode", "none"),
-                early_stopping_patience=train_request.get("early_stopping_patience", 250)
+                early_stopping_patience=early_stopping_patience,
             )
         ],
     )
 
-    trainer.tokenizer = tokenizer
     # last_checkpoint = get_last_checkpoint(training_args.output_dir)
     # log_info(f"last_checkpoint: {last_checkpoint}")
     trainer.train()
