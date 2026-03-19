@@ -39,7 +39,7 @@ import math
 from customized_trainer import (
     resize_if_needed,
     set_generation_config,
-    CustomEvalSaveCallback,
+    GRPOCustomEvalSaveCallback,
     WhenToEvalHandler,
     get_early_stopping_patience,
     init_wandb,
@@ -66,7 +66,7 @@ from tokenize_grpo import get_dataset
 from customized_trainer import (
     resize_if_needed,
     set_generation_config,
-    CustomEvalSaveCallback,
+    GRPOCustomEvalSaveCallback,
     WhenToEvalHandler,
     get_early_stopping_patience,
     init_wandb,
@@ -554,7 +554,7 @@ def main():
         processing_class=tokenizer,
         peft_config=peft_config,
         callbacks=[
-            CustomEvalSaveCallback(
+            GRPOCustomEvalSaveCallback(
                 WhenToEvalHandler(end_time_str, save_before, periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
                 train_request["submission_dir"],
                 training_args.output_dir,

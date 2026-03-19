@@ -371,18 +371,15 @@ class CustomEvalSaveCallback(TrainerCallback):
 
 class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
     def compute_loss(self, state: TrainerState, metrics):
-        eval_loss = None
-        if state.log_history:
-            last_log_entry = state.log_history[-1]
-            eval_loss = last_log_entry.get("eval_reward", None)
-            print(f"choose eval_loss ({eval_loss}) as eval_reward from: last_log_entry: {last_log_entry}; \n metrics: {metrics}", flush=True)
-        else:
-            print(f"state.log_history is empty", flush=True)
-            
-        if eval_loss is not None:
-            eval_loss = - eval_loss
-            
-        return eval_loss
+        # GRPO reports eval_reward (higher = better). Use as "loss" = -reward for best-checkpoint selection.
+        eval_reward = None
+        if metrics is not None:
+            eval_reward = metrics.get("eval_reward")
+        if eval_reward is None and state.log_history:
+            eval_reward = state.log_history[-1].get("eval_reward")
+        if eval_reward is not None:
+            return -float(eval_reward)  # lower "loss" = higher reward = better
+        return None
     
     def penalize_eval_loss(self, eval_loss: float):
         if eval_loss < 0:
@@ -392,10 +389,16 @@ class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
 
 
 def get_remaining_seconds(end_time_str: str) -> float:
-    """Return seconds until end_time (negative if past)."""
-    et = datetime.datetime.strptime(end_time_str.strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    now = datetime.datetime.now(timezone.utc)
-    return (et - now).total_seconds()
+    """Return seconds until end_time (negative if past). If empty/invalid, return a large value so end_time never triggers."""
+    _NO_END_TIME = 1e9
+    if not end_time_str or not str(end_time_str).strip():
+        return _NO_END_TIME
+    try:
+        et = datetime.datetime.strptime(end_time_str.strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        now = datetime.datetime.now(timezone.utc)
+        return (et - now).total_seconds()
+    except (ValueError, TypeError):
+        return _NO_END_TIME
 
 
 def format_remaining(remaining_sec: float) -> str:
@@ -454,7 +457,7 @@ class WhenToEvalHandler:
         if self.periodic_save_steps != -1 and global_step % self.periodic_save_steps == 0 and global_step > 1:
             return {"eval": True, "reason": "periodic"}
         
-        if self.save_before_remaining_time > 0 and not self.run_eval:
+        if self.save_before_remaining_time > 0 and self.end_time and not self.run_eval:
             remaining = get_remaining_seconds(self.end_time)
             if remaining < self.save_before_remaining_time * 60:
                 print(f"***ALERT: Remaining time until end_time: {format_remaining(remaining)} - eval & save then stop", flush=True)

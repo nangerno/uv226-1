@@ -359,14 +359,14 @@ def main():
         peft_config=peft_config,
         callbacks=[
             CustomEvalSaveCallback(
-                WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
+                WhenToEvalHandler(train_request.get("end_time", ""), train_request.get("save_before_remaining_time", 3), periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
                 train_request["submission_dir"],
                 training_args.output_dir,
                 train_request["model_name"],
                 max_steps,
                 checking_step=checking_step,
                 total_steps_all_epochs=total_steps_all_epochs,
-                end_time=train_request["end_time"],
+                end_time=train_request.get("end_time", ""),
                 checking_mode=train_request.get("checking_mode", "none"),
                 early_stopping_patience=early_stopping_patience,
             )
